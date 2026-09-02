@@ -72,6 +72,17 @@ int find_by_pid(uint16_t pid) {
 int find_hole(void) {
     for (int i = 0; i < MAX_PROC; i++)
         if (table[i].state == P_EMPTY) return i;
+    /* zombi slotlari da geri kazan: stack'lerini birak, tabloyu bosalt */
+    for (int i = 0; i < MAX_PROC; i++) {
+        if (table[i].state != P_ZOMBIE) continue;
+        Process& p = table[i];
+        if (p.kstack) kfree((void*)p.kstack);
+        if (p.usp)    kfree((void*)p.usp);
+        p.kstack = p.usp = 0;
+        p.pid    = 0;
+        p.state  = P_EMPTY;
+        return i;
+    }
     return -1;
 }
 

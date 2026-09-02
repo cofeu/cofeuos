@@ -42,10 +42,10 @@ extern "C" void kernel_main(void) {
     keyboard_init();
 
     sched_init();
-    int p1 = sched_spawn("mercury", 'M', 200, 0);
-    int p2 = sched_spawn("venus",   'V', 320, 0);
-    int p3 = sched_spawn("earth",   'E', 480, 0);
-    int p4 = sched_spawn("byn",     'B', 60, 3);
+    int p1 = sched_spawn("mercury", 'M', 200, 5);
+    int p2 = sched_spawn("venus",   'V', 320, 4);
+    int p3 = sched_spawn("earth",   'E', 480, 3);
+    int p4 = sched_spawn("byn",     'B',   60, 3);
     kprintf("sched: demo islemler (pid %04X, %04X, %04X, %04X)\n",
             p1 & 0xFFFF, p2 & 0xFFFF, p3 & 0xFFFF, p4 & 0xFFFF);
     kslog("sched spawns %d/%d/%d/%d\n", p1, p2, p3, p4);
