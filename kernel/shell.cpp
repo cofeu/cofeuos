@@ -5,6 +5,18 @@
 
 namespace {
 
+/* ---- VGA renk yardimcilari (serial mirror'a dokunmaz) ---- */
+enum VGAC { VGA_BLACK=0x0, VGA_BLUE=0x1, VGA_GREEN=0x2, VGA_CYAN=0x3,
+            VGA_RED=0x4, VGA_MAGENTA=0x5, VGA_BROWN=0x6, VGA_LIGHT_GRAY=0x7,
+            VGA_DARK_GRAY=0x8, VGA_LIGHT_BLUE=0x9, VGA_LIGHT_GREEN=0xA,
+            VGA_LIGHT_CYAN=0xB, VGA_LIGHT_RED=0xC, VGA_LIGHT_MAGENTA=0xD,
+            VGA_YELLOW=0xE, VGA_WHITE=0xF };
+
+#define VGA_FG(bg, fg) ((uint8_t)(((bg) << 4) | (fg)))
+
+void set_color(uint8_t c) { vga_set_color(c); }
+void rst_color(void)      { vga_set_color(VGA_FG(VGA_BLACK, VGA_LIGHT_GRAY)); }
+
 int atoi_cst(const char* s) {
     int v = 0, sg = 1;
     if (!s) return 0;
@@ -20,6 +32,7 @@ const char* HELP =
     "  clear                    - ekrani temizle\n"
     "  ls [yol]                 - dizin listele\n"
     "  cd <yol>                 - dizin degistir\n"
+    "  pwd                      - calisma dizinini goster\n"
     "  mkdir <yol>              - dizin olustur\n"
     "  touch <yol>              - bos dosya olustur\n"
     "  echo <metin>             - metni yazdir\n"
@@ -61,9 +74,13 @@ int tokenize(char* line, Tokens& t) {
 void print_entries_cb(const fs::EntryInfo& e, void* ctx) {
     (void)ctx;
     if (e.type_ == 2) {
+        set_color(VGA_FG(VGA_BLACK, VGA_LIGHT_CYAN));
         kprintf("%-31s <DIZIN>\n", e.name_);
+        rst_color();
     } else {
+        set_color(VGA_FG(VGA_BLACK, VGA_LIGHT_GRAY));
         kprintf("%-31s    %u bayt\n", e.name_, e.size_);
+        rst_color();
     }
 }
 
@@ -249,6 +266,7 @@ bool run_line(char* line, uint32_t& cwd, char* cwdstr) {
         else if (!fs::remove_file(cwd, t.tok[idx], rec)) kprintf("hata: silinemedi\n");
     }
     else if (strcmp(cmd, "lsfs") == 0)     cmd_lsfs();
+    else if (strcmp(cmd, "pwd") == 0)      kprintf("%s\n", cwdstr);
     else if (strcmp(cmd, "uptime") == 0)   kprintf("calisma suresi: %llu sn\n", timer_get_seconds());
     else if (strcmp(cmd, "mem") == 0) {
         kprintf("RAM        : %lu MB (%lu KB)\n", pmm_total_kb() / 1024u, pmm_total_kb());
@@ -331,19 +349,23 @@ void shell_run(void) {
     strcpy(cwdstr, "/");
 
     kprintf("\n");
+    set_color(VGA_FG(VGA_BLACK, VGA_LIGHT_CYAN));
     kprintf(" ###############################################\n");
     kprintf(" #  cofeuos 0.1 - x86_64 toy OS                #\n");
     kprintf(" #  assembly + C + C++                         #\n");
     kprintf(" #  'help' yazarak komutlari gorebilirsin      #\n");
     kprintf(" ###############################################\n");
+    rst_color();
     kprintf("\n");
 
     char line[256];
     for (;;) {
+        set_color(VGA_FG(VGA_BLACK, VGA_LIGHT_GREEN));
         if (strcmp(cwdstr, "/") == 0)
             kprintf("cofeuos:/$ ");
         else
             kprintf("cofeuos:%s$ ", cwdstr);
+        rst_color();
         read_line(line, sizeof(line));
         if (line[0]) run_line(line, cwd, cwdstr);
     }

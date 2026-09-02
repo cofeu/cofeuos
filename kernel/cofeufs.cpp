@@ -184,6 +184,12 @@ static bool dir_find(const Inode& d, const char* name, DirEntry& out, uint32_t& 
             slot_out = i;
             return true;
         }
+        /* ".." kok dizine isaret edebilir; o zaman e.ino==0 gecerli bir giris */
+        if (strcmp(name, "..") == 0 && strcmp(e.name, "..") == 0) {
+            out = e;
+            slot_out = i;
+            return true;
+        }
     }
     return false;
 }
@@ -445,7 +451,7 @@ static bool create_inode(uint32_t base, const char* path, bool is_dir) {
         ni.blocks[0] = idx;
         ni.size = 2 * DE_SIZE;
         DirEntry dot{ino, {0}, FT_DIR, {0, 0, 0}};   strcpy(dot.name, ".");
-        DirEntry ddot{ino, {0}, FT_DIR, {0, 0, 0}};  strcpy(ddot.name, "..");
+        DirEntry ddot{parent, {0}, FT_DIR, {0, 0, 0}}; strcpy(ddot.name, "..");
         memset(sec, 0, 512);
         memcpy(sec, &dot, DE_SIZE);
         memcpy(sec + DE_SIZE, &ddot, DE_SIZE);
