@@ -12,8 +12,8 @@ CXXFLAGS += -O2 -Wall -Wextra -DKCOFEUOS -Iinclude
 LDFLAGS   = -m elf_x86_64 -T linker.ld -nostdlib -z max-page-size=0x1000
 
 OBJ = kernel/entry.o kernel/isr.o kernel/main.o kernel/util.o kernel/memory.o \
-      kernel/kprintf.o kernel/vga.o kernel/serial.o kernel/gdt.o kernel/idt.o \
-      kernel/irq.o kernel/timer.o kernel/keyboard.o kernel/ata.o \
+      kernel/pmm.o kernel/kprintf.o kernel/vga.o kernel/serial.o kernel/gdt.o \
+      kernel/idt.o kernel/irq.o kernel/timer.o kernel/keyboard.o kernel/ata.o \
       kernel/cofeufs.o kernel/shell.o
 
 DISK_SIZE_SECTORS = 67584

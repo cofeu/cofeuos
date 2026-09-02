@@ -29,6 +29,9 @@ SECTIONS
         __kstack_top = . + 0x20000;
     }
 
+    /* cekirdegin fiziksel bitisi: PMM buradan itibaren frame ayirir */
+    __kernel_end = __kstack_top;
+
     /DISCARD/ : {
         *(.comment)
         *(.eh_frame)

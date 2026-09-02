@@ -1,5 +1,6 @@
 #include "kernel.h"
 #include "x86.h"
+#include "pmm.h"
 
 extern "C" void kernel_main(void) {
     vga_init();
@@ -12,6 +13,16 @@ extern "C" void kernel_main(void) {
     idt_init();
     pic_remap();
     timer_init();
+
+    pmm_init();
+    kmalloc_init();
+
+    kprintf("mem : %lu MB toplam, %lu KB yonetilen, %lu serbest frame, heap %lu/%lu KB\n",
+            pmm_total_kb() / 1024u, pmm_managed_kb(),
+            (unsigned long)pmm_free_frames(),
+            (unsigned long)(kmem_used() / 1024u), (unsigned long)(kmem_capacity() / 1024u));
+    kslog("mem total=%luKB managed=%luKB heap_cap=%luKB\n",
+          pmm_total_kb(), pmm_managed_kb(), (unsigned long)(kmem_capacity() / 1024u));
 
     cpu_sti();
 

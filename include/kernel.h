@@ -38,8 +38,10 @@ void  kprintf(const char* fmt, ...);
 void  kslog(const char* fmt, ...);
 int   ksnprintf(char* buf, size_t n, const char* fmt, ...);
 
-/* bellek albkatoforu (bump allocator + operator new/delete) */
+/* bellek albkatoforu: pmm arena uzerinde free-list (operator new/delete ile) */
+void kmalloc_init(void);
 void* kmalloc(size_t n);
+void kfree(void* p);
 
 /* ---- VGA metin modu ---- */
 void vga_init(void);

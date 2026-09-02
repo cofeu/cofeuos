@@ -1,5 +1,6 @@
 #include "kernel.h"
 #include "x86.h"
+#include "pmm.h"
 
 namespace {
 
@@ -236,7 +237,15 @@ bool run_line(char* line, uint32_t& cwd, char* cwdstr) {
     }
     else if (strcmp(cmd, "lsfs") == 0)     cmd_lsfs();
     else if (strcmp(cmd, "uptime") == 0)   kprintf("calisma suresi: %llu sn\n", timer_get_seconds());
-    else if (strcmp(cmd, "mem") == 0)      kprintf("heap: %u / %u bayt\n", kmem_used(), kmem_capacity());
+    else if (strcmp(cmd, "mem") == 0) {
+        kprintf("RAM        : %lu MB (%lu KB)\n", pmm_total_kb() / 1024u, pmm_total_kb());
+        kprintf("yonetilen  : %lu KB (%lu frame, %lu serbest)\n",
+                pmm_managed_kb(), (unsigned long)pmm_total_frames(),
+                (unsigned long)pmm_free_frames());
+        kprintf("heap       : %lu / %lu KB\n",
+                (unsigned long)(kmem_used() / 1024u),
+                (unsigned long)(kmem_capacity() / 1024u));
+    }
     else if (strcmp(cmd, "reboot") == 0) {
         kprintf("yeniden baslatiliyor...\n");
         outw(0xCF9, 0x06);

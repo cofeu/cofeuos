@@ -56,7 +56,34 @@ start:
     out 0x92, al
 .a20_ok:
 
-    ; ---- sayfa tablolari: 0..64MB kimlik haritasi (2MB sayfalar) ----
+    ; ---- BIOS E820 bellek haritasi ----
+    ;   sayac : 0x7FF0, girdiler : 0x8000 (24 bayt / entry)
+    ;   BIOS tamponu ES:DI ciftini ister; DS/ES'i 0 yap (yigin 0x9000'in altini kullanir).
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
+    mov word [0x7FF0], 0
+    mov di, 0x8000
+    xor ebx, ebx
+.e820_next:
+    mov eax, 0xE820                       ; Int15/AX=E820
+    mov edx, 0x534D4150                   ; 'SMAP'
+    mov ecx, 24
+    mov dword [di + 20], 1                ; acpi 3.0 boyutu (20 bayt yazilir)
+    int 0x15
+    jc .e820_done
+    cmp eax, 0x534D4150
+    jne .e820_done
+    inc word [0x7FF0]
+    test ebx, ebx
+    jz .e820_done
+    add di, 24
+    cmp di, 0x8F00
+    jae .e820_done
+    jmp .e820_next
+.e820_done:
+
+    ; ---- sayfa tablolari: 0..1GB kimlik haritasi (2MB sayfalar) ----
     ; (16-bit modda 32-bit adresler icin register tabanli erisim sart)
     xor eax, eax
     mov ebx, PML4_ADDR
@@ -76,7 +103,7 @@ start:
 
     mov ebx, 0x72000
     mov eax, 0x83                            ; present | rw | PS (2MB)
-    mov ecx, 32                              ; 32 * 2MB = 64MB
+    mov ecx, 512                             ; 512 * 2MB = 1GB identity
 .pt:
     mov [ebx], eax
     add eax, 0x200000
