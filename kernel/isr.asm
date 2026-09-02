@@ -1,6 +1,8 @@
 ; ============================================================================
 ;  isr.asm - 64-bit interrupt stublari (256 vektor) ve ortak isleyici cikisi
-;  C tarafinda:  extern "C" void isr_dispatch(uint64 vec, uint64 err);
+;  C tarafinda:
+;    extern "C" uint64_t isr_dispatch(uint64 vec, uint64 err, uint64 ctx);
+;  isr_dispatch yeni rsp (task switch icin) dondurur, daha sonra yuklenir.
 ; ============================================================================
 BITS 64
 default rel
@@ -45,8 +47,10 @@ isr_common:
 
     mov rdi, [rsp + 15*8 + 0]      ; vektor
     mov rsi, [rsp + 15*8 + 8]      ; error code
+    mov rdx, rsp                   ; ctx: isr_common sonrasi kayitli rsp
     call isr_dispatch
 
+    mov rsp, rax                   ; task switch olduysa yeni ctx'e gec
     pop r15
     pop r14
     pop r13

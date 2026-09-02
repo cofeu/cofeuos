@@ -95,14 +95,14 @@ start:
     jnz .zero
 
     mov ebx, PML4_ADDR
-    mov eax, 0x71003                       ; PML4[0] -> PDPT
+    mov eax, 0x71007                       ; PML4[0] -> PDPT (user)
     mov [ebx], eax
     mov ebx, 0x71000
-    mov eax, 0x72003                       ; PDPT[0] -> PD
+    mov eax, 0x72007                       ; PDPT[0] -> PD (user)
     mov [ebx], eax
 
     mov ebx, 0x72000
-    mov eax, 0x83                            ; present | rw | PS (2MB)
+    mov eax, 0x87                            ; present | rw | user | PS (2MB)
     mov ecx, 512                             ; 512 * 2MB = 1GB identity
 .pt:
     mov [ebx], eax

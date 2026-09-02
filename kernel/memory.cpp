@@ -29,13 +29,13 @@ void* alloc_from(size_t need) {
     while (*pp) {
         Block* b = *pp;
         if (b->size >= need) {
-            if (b->size - need >= MIN_BLOCK) {
+if (b->size - need >= MIN_BLOCK) {
                 Block* rest = (Block*)((uint8_t*)b + need);
                 rest->size  = b->size - need;
                 rest->next  = b->next;
-                b->next     = rest;
+                *pp = rest;                 /* kalan ilk uye; b'nin tamami ayrici */
             } else {
-                *pp = b->next;                 /* blogun tamamini kullan */
+                *pp = b->next;              /* blogun tamamini kullan */
             }
             b->size = need;
             return b + 1;

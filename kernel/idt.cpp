@@ -23,20 +23,27 @@ struct __attribute__((packed)) IDTR {
 IDTGate idt[256];
 IDTR idtr;
 
+void set_gate(int i, uint16_t sel, uint8_t attr) {
+    uint64_t off = isr_stub_table[i];
+    idt[i].off0 = (uint16_t)(off & 0xFFFF);
+    idt[i].sel  = sel;
+    idt[i].ist  = 0;
+    idt[i].attr = attr;
+    idt[i].off1 = (uint16_t)((off >> 16) & 0xFFFF);
+    idt[i].off2 = (uint32_t)(off >> 32);
+    idt[i].zero = 0;
+}
+
 } /* namespace */
 
 extern "C" void idt_init(void) {
-    for (int i = 0; i < 256; i++) {
-        uint64_t off = isr_stub_table[i];
-        idt[i].off0 = (uint16_t)(off & 0xFFFF);
-        idt[i].sel  = 0x08;
-        idt[i].ist  = 0;
-        idt[i].attr = 0x8E;               /* present, ring0, interrupt gate */
-        idt[i].off1 = (uint16_t)((off >> 16) & 0xFFFF);
-        idt[i].off2 = (uint32_t)(off >> 32);
-        idt[i].zero = 0;
-    }
+    for (int i = 0; i < 256; i++)
+        set_gate(i, 0x08, 0x8E);       /* present, ring0, interrupt gate */
+
+    /* syscall kapisi: ring3'ten int 0x80 ile cagrilabilir (DPL3) */
+    set_gate(0x80, 0x08, 0xEE);        /* 0xEE = present | DPL3 | interrupt gate */
+
     idtr.limit = sizeof(idt) - 1;
-    idtr.base = (uint64_t)idt;
+    idtr.base  = (uint64_t)idt;
     asm volatile("lidt %0" : : "m"(idtr) : "memory");
 }

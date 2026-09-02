@@ -1,8 +1,18 @@
 #include "kernel.h"
 #include "x86.h"
 #include "pmm.h"
+#include "sched.h"
 
 namespace {
+
+int atoi_cst(const char* s) {
+    int v = 0, sg = 1;
+    if (!s) return 0;
+    while (*s == ' ') s++;
+    if (*s == '-') { sg = -1; s++; }
+    while (*s >= '0' && *s <= '9') { v = v * 10 + (*s - '0'); s++; }
+    return v * sg;
+}
 
 const char* HELP =
     "cofeuos komutlari:\n"
@@ -22,6 +32,9 @@ const char* HELP =
     "  uptime                   - calisma suresi\n"
     "  ver                      - surum bilgisi\n"
     "  mem                      - bellek kullanimi\n"
+    "  ps                       - surec listesi\n"
+    "  kill <pid>               - sureci oldur\n"
+    "  spawn <ad>               - yeni surec baslat\n"
     "  reboot                   - yeniden baslat\n"
     "  poweroff                 - kapat\n";
 
@@ -246,6 +259,23 @@ bool run_line(char* line, uint32_t& cwd, char* cwdstr) {
                 (unsigned long)(kmem_used() / 1024u),
                 (unsigned long)(kmem_capacity() / 1024u));
     }
+    else if (strcmp(cmd, "ps") == 0)       sched_list();
+    else if (strcmp(cmd, "kill") == 0) {
+        if (t.n < 2) kprintf("kullanim: kill <pid>\n");
+        else {
+            int pid = atoi_cst(t.tok[1]);
+            if (pid < 1 || pid > 0xFFFF || sched_kill((uint16_t)pid) != 0)
+                kprintf("hata: %d oldurulemedi\n", pid);
+            else
+                kprintf("surec %d olduruldu\n", pid);
+        }
+    }
+    else if (strcmp(cmd, "spawn") == 0) {
+        const char* nm = (t.n >= 2) ? t.tok[1] : "proc";
+        int pid = sched_spawn(nm, 'x', 200, 0);
+        if (pid < 0) kprintf("hata: baslatilamadi (tablo dolu)\n");
+        else kprintf("baslatildi pid=0x%04X (%d)\n", (uint16_t)pid, pid);
+    }
     else if (strcmp(cmd, "reboot") == 0) {
         kprintf("yeniden baslatiliyor...\n");
         outw(0xCF9, 0x06);
@@ -264,11 +294,14 @@ bool run_line(char* line, uint32_t& cwd, char* cwdstr) {
 void read_line(char* line, int max) {
     int pos = 0;
     line[0] = 0;
+    char c;
     for (;;) {
-        if (!keyboard_has_char()) { cpu_hlt(); continue; }
-        char c = keyboard_getc();
+        if (keyboard_has_char())       c = keyboard_getc();
+        else if (serial_has_char())    c = serial_getc();
+        else { cpu_hlt(); continue; }
         if (c == '\r' || c == '\n') {
             vga_putc('\n');
+            serial_putc('\r'); serial_putc('\n');
             line[pos] = 0;
             return;
         }
@@ -276,6 +309,7 @@ void read_line(char* line, int max) {
             if (pos > 0) {
                 pos--;
                 vga_putc('\b');
+                serial_putc('\b');
             }
             continue;
         }
@@ -284,6 +318,7 @@ void read_line(char* line, int max) {
             line[pos++] = c;
             line[pos] = 0;
             vga_putc(c);
+            serial_putc(c);
         }
     }
 }

@@ -1,5 +1,6 @@
 #include "kernel.h"
 #include "x86.h"
+#include "sched.h"
 
 namespace {
 
@@ -18,6 +19,36 @@ bool is_exception_fatal(uint64_t vec) {
     default:
         return true;
     }
+}
+
+uint64_t exception_crash(uint64_t vec, uint64_t err, uint64_t ctx) {
+    static const char* names[32] = {
+        "Divide Error", "Debug", "NMI", "Breakpoint", "Overflow",
+        "BOUND Range Exceeded", "Invalid Opcode", "Device Not Available",
+        "Double Fault", "Coprocessor Segment Overrun", "Invalid TSS",
+        "Segment Not Present", "Stack-Segment Fault", "General Protection Fault",
+        "Page Fault", "Reserved", "x87 FPU Error", "Alignment Check",
+        "Machine Check", "SIMD FPU Error", "Virtualization Exception",
+        "Control Protection", "Reserved", "Reserved", "Reserved",
+        "Reserved", "Reserved", "Reserved", "Reserved", "Reserved",
+        "Security Exception", "Reserved"
+    };
+    uint64_t* r = (uint64_t*)ctx;
+    uint64_t uip = ((r[18] & 3) == 3) ? r[17] : 0;   /* cs ve rip (user) */
+    uint64_t cr2 = 0;
+    if (vec == 14) asm volatile("mov %%cr2, %0" : "=r"(cr2));
+    kslog("EXCEPTION %llu (%s), err=0x%llx uip=0x%llx cr2=0x%llx cs=0x%llx\n",
+          vec, vec < 32 ? names[vec] : "?", err, uip, cr2, r[18]);
+    kprintf("\n## EXCEPTION: %s (vec=%d err=0x%x%s)\n",
+            vec < 32 ? names[vec] : "?", (int)vec, (uint32_t)err,
+            uip ? " [user]" : "");
+    if (vec == 14) kprintf("## cr2=0x%x\n", (uint32_t)cr2);
+    if (!is_exception_fatal(vec)) return ctx;
+    kprintf("## system halted\n");
+    cpu_cli();
+    for (;;) cpu_hlt();
+
+    return ctx;
 }
 
 } /* namespace */
@@ -47,37 +78,19 @@ extern "C" void pic_send_eoi(uint8_t irq) {
     outb(0x20, 0x20);
 }
 
-extern "C" void isr_dispatch(uint64_t vec, uint64_t err) {
-    if (vec < 32) {
-        static const char* names[32] = {
-            "Divide Error", "Debug", "NMI", "Breakpoint", "Overflow",
-            "BOUND Range Exceeded", "Invalid Opcode", "Device Not Available",
-            "Double Fault", "Coprocessor Segment Overrun", "Invalid TSS",
-            "Segment Not Present", "Stack-Segment Fault", "General Protection Fault",
-            "Page Fault", "Reserved", "x87 FPU Error", "Alignment Check",
-            "Machine Check", "SIMD FPU Error", "Virtualization Exception",
-            "Control Protection", "Reserved", "Reserved", "Reserved",
-            "Reserved", "Reserved", "Reserved", "Reserved", "Reserved",
-            "Security Exception", "Reserved"
-        };
-        kslog("EXCEPTION %llu (%s), err=0x%llx\n", vec,
-              vec < 32 ? names[vec] : "?", err);
-        kprintf("\n## EXCEPTION: %s (vec=%d err=0x%x)\n",
-                vec < 32 ? names[vec] : "?", (int)vec, (uint32_t)err);
-        if (is_exception_fatal(vec)) {
-            kprintf("## system halted\n");
-            cpu_cli();
-            for (;;) cpu_hlt();
-        }
-        return;
-    }
+extern "C" uint64_t isr_dispatch(uint64_t vec, uint64_t err, uint64_t ctx) {
+    if (vec < 32)
+        return exception_crash(vec, err, ctx);
+
+    if (vec == 0x80)
+        return syscall_handle(ctx);
 
     if (vec >= 0x20 && vec < 0x30) {
         switch (vec) {
         case 0x20:
             timer_irq();
             pic_send_eoi(0);
-            break;
+            return sched_tick(ctx);
         case 0x21:
             keyboard_irq();
             pic_send_eoi(1);
@@ -89,8 +102,9 @@ extern "C" void isr_dispatch(uint64_t vec, uint64_t err) {
             pic_send_eoi((uint8_t)(vec - 0x20));
             break;
         }
-        return;
+        return ctx;
     }
 
     kslog("unhandled interrupt vec=%llu\n", vec);
+    return ctx;
 }

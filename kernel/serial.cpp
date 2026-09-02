@@ -27,3 +27,12 @@ extern "C" void serial_write(const char* s) {
         serial_putc(*s++);
     }
 }
+
+extern "C" bool serial_has_char(void) {
+    return (inb(COM1 + 5) & 0x01) != 0;
+}
+
+extern "C" char serial_getc(void) {
+    if (!(inb(COM1 + 5) & 0x01)) return 0;
+    return (char)inb(COM1);
+}

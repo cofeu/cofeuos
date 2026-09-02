@@ -55,13 +55,16 @@ void vga_set_cursor(uint8_t x, uint8_t y);
 void serial_init(void);
 void serial_putc(char c);
 void serial_write(const char* s);
+bool serial_has_char(void);
+char serial_getc(void);
 
 /* ---- GDT / IDT / IRQ ---- */
 void gdt_init(void);
 void idt_init(void);
 void pic_remap(void);
 void pic_send_eoi(uint8_t irq);
-extern void isr_dispatch(uint64_t vec, uint64_t err);
+void tss_set_rsp0(uint64_t rsp0);
+extern uint64_t isr_dispatch(uint64_t vec, uint64_t err, uint64_t ctx);
 
 /* ---- PIT zamanlayici (100Hz) ---- */
 void timer_init(void);

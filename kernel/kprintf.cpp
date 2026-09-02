@@ -110,7 +110,11 @@ void vformat(emit_fn emit, void* ctx, const char* fmt, va_list ap) {
     }
 }
 
-void emit_vga(char c, void*) { vga_putc(c); }
+void emit_vga_serial(char c, void*) {
+    vga_putc(c);
+    if (c == '\n') serial_putc('\r');
+    serial_putc(c);
+}
 
 void emit_serial(char c, void*) {
     if (c == '\n') serial_putc('\r');
@@ -122,7 +126,7 @@ void emit_serial(char c, void*) {
 extern "C" void kprintf(const char* fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    vformat(emit_vga, NULL, fmt, ap);
+    vformat(emit_vga_serial, NULL, fmt, ap);
     va_end(ap);
 }
 
