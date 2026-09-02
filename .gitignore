@@ -3,3 +3,5 @@ kernel.elf
 kernel.bin
 kernel/*.o
 boot/boot.bin
+user/user_demo.elf
+user/user_demo.bin

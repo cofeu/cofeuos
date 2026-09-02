@@ -272,7 +272,7 @@ bool run_line(char* line, uint32_t& cwd, char* cwdstr) {
     }
     else if (strcmp(cmd, "spawn") == 0) {
         const char* nm = (t.n >= 2) ? t.tok[1] : "proc";
-        int pid = sched_spawn(nm, 'x', 200, 0);
+        int pid = sched_spawn(nm);
         if (pid < 0) kprintf("hata: baslatilamadi (tablo dolu)\n");
         else kprintf("baslatildi pid=0x%04X (%d)\n", (uint16_t)pid, pid);
     }

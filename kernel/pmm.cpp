@@ -37,6 +37,7 @@ static void range_mark(uint64_t p, uint32_t n, bool used) {
         uint32_t byte = idx >> 3, bit = idx & 7;
         if (used) bits[byte] |= (uint8_t)(1u << bit);
         else      bits[byte] &= (uint8_t)~(1u << bit);
+        p += 4096;
     }
 }
 

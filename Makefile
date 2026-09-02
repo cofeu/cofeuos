@@ -1,3 +1,4 @@
+CC       ?= gcc
 CXX      ?= g++
 LD       ?= ld
 NASM     ?= nasm
@@ -9,12 +10,16 @@ CXXFLAGS += -fno-pic -fno-stack-protector -fno-builtin -fno-plt -mgeneral-regs-o
 CXXFLAGS += -mno-red-zone -mcmodel=small -mno-mmx -mno-sse -mno-sse2 -mno-80387
 CXXFLAGS += -O2 -Wall -Wextra -DKCOFEUOS -Iinclude
 
+USERFLAGS = -Os -m64 -ffreestanding -nostdlib -fno-pic -no-pie -fno-stack-protector
+USERFLAGS += -fno-builtin -fno-plt -mgeneral-regs-only -fno-asynchronous-unwind-tables
+USERFLAGS += -Wl,-Ttext=0x40000000 -Wl,--entry=_start -Wl,--build-id=none
+
 LDFLAGS   = -m elf_x86_64 -T linker.ld -nostdlib -z max-page-size=0x1000
 
 OBJ = kernel/entry.o kernel/isr.o kernel/main.o kernel/util.o kernel/memory.o \
       kernel/pmm.o kernel/kprintf.o kernel/vga.o kernel/serial.o kernel/gdt.o \
       kernel/idt.o kernel/irq.o kernel/timer.o kernel/keyboard.o kernel/ata.o \
-      kernel/cofeufs.o kernel/shell.o kernel/sched.o
+      kernel/cofeufs.o kernel/shell.o kernel/sched.o kernel/user_embed.o
 
 DISK_SIZE_SECTORS = 67584
 
@@ -34,6 +39,19 @@ boot/boot.bin: boot/boot.asm kernel.bin
 
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
+
+user/user_demo.elf: user/user.c
+	$(CC) $(USERFLAGS) -o $@ $<
+
+user/user_demo.bin: user/user_demo.elf
+	$(OBJCOPY) -O binary --remove-section=.note.gnu.property $< $@
+	@echo "user entry: $$(readelf -h $< | grep 'Entry point' | sed -n 's/.*\(0x[0-9a-fA-F]*\).*/\1/p')"
+
+kernel/user_embed.o: user/user_demo.bin
+	$(LD) -r -b binary $< -o $@
+
+kernel/sched.o: kernel/sched.cpp user/user_demo.elf
+	$(CXX) $(CXXFLAGS) -DUSER_ENTRY_ADDR=$$(readelf -h user/user_demo.elf | grep 'Entry point' | sed -n 's/.*\(0x[0-9a-fA-F]*\).*/\1/p') -c -o $@ $<
 
 kernel.elf: $(OBJ) linker.ld
 	$(LD) $(LDFLAGS) -o $@ $(OBJ)
@@ -63,4 +81,4 @@ run-headless: disk.img
 
 clean:
 	rm -f kernel.elf kernel.bin disk.img boot/boot.bin
-	rm -f kernel/*.o
+	rm -f kernel/*.o user/user_demo.elf user/user_demo.bin

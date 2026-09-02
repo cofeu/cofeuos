@@ -38,3 +38,13 @@ static inline uint64_t read_rflags(void) {
     asm volatile("pushfq; popq %0" : "=r"(f));
     return f;
 }
+
+static inline uint64_t read_cr3(void) {
+    uint64_t v;
+    asm volatile("mov %%cr3, %0" : "=r"(v));
+    return v;
+}
+
+static inline void write_cr3(uint64_t v) {
+    asm volatile("mov %0, %%cr3" : : "r"(v) : "memory");
+}

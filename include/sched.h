@@ -11,13 +11,18 @@
 #define SYS_GETTICKS  5
 #define SYS_PUTC      6
 #define SYS_PUTSN     7
+#define SYS_FORK      8
+#define SYS_GETNAME   9
 
 extern "C" {
 
 void   sched_init(void);
-int    sched_spawn(const char* name, char tag, uint32_t period_ms, uint32_t iters);
+void   sched_go(void);                       /* spawn'lardan sonra cagrilir */
+int    sched_spawn(const char* name);
 uint64_t sched_tick(uint64_t ctx);   /* zamanlayici: dondurdugu ctx'e gecilir */
+uint64_t sched_reschedule(uint64_t ctx);
 uint64_t syscall_handle(uint64_t ctx);
+uint64_t sched_userpf_kill(uint64_t ctx);
 void   sched_list(void);
 int    sched_kill(uint16_t pid);
 int    sched_count(void);

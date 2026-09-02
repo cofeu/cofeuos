@@ -79,8 +79,14 @@ extern "C" void pic_send_eoi(uint8_t irq) {
 }
 
 extern "C" uint64_t isr_dispatch(uint64_t vec, uint64_t err, uint64_t ctx) {
-    if (vec < 32)
+    if (vec < 32) {
+        /* kullanici modunda page fault: sureci oldur, sistemi degil (izolasyon) */
+        if (vec == 14) {
+            uint64_t* r = (uint64_t*)ctx;
+            if ((r[18] & 3) == 3) return sched_userpf_kill(ctx);   /* [18] = cs */
+        }
         return exception_crash(vec, err, ctx);
+    }
 
     if (vec == 0x80)
         return syscall_handle(ctx);
