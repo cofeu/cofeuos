@@ -19,6 +19,7 @@ extern "C" {
 void   sched_init(void);
 void   sched_go(void);                       /* spawn'lardan sonra cagrilir */
 int    sched_spawn(const char* name);
+int    sched_exec_file(const char* path);    /* diskten ELF calistir (run) */
 uint64_t sched_tick(uint64_t ctx);   /* zamanlayici: dondurdugu ctx'e gecilir */
 uint64_t sched_reschedule(uint64_t ctx);
 uint64_t syscall_handle(uint64_t ctx);

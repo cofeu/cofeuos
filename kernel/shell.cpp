@@ -48,8 +48,16 @@ const char* HELP =
     "  ps                       - surec listesi\n"
     "  kill <pid>               - sureci oldur\n"
     "  spawn <ad>               - yeni surec baslat\n"
+    "  run <dosya.cexe>         - ELF uygulama calistir (diskten)\n"
     "  reboot                   - yeniden baslat\n"
-    "  poweroff                 - kapat\n";
+    "  poweroff                 - kapat\n"
+    "\n"
+    "dizin yapisi:\n"
+    "  /    - kok\n"
+    "  /temp - gecici dosyalar\n"
+    "  /sys  - sistem dosyalari ve .cexe uygulamalari\n"
+    "  /uspc - kullanicinin yonettigi alan\n"
+    "uygulama uzantisi: .cexe (cofeuos executable)\n";
 
 struct Tokens {
     char tok[32][32];
@@ -263,7 +271,15 @@ bool run_line(char* line, uint32_t& cwd, char* cwdstr) {
         int idx = 1;
         if (t.n >= 2 && strcmp(t.tok[1], "-r") == 0) { rec = true; idx = 2; }
         if (t.n <= idx) kprintf("kullanim: rm [-r] <yol>\n");
-        else if (!fs::remove_file(cwd, t.tok[idx], rec)) kprintf("hata: silinemedi\n");
+        else {
+            fs::EntryInfo st;
+            bool is_dir = (fs::stat(cwd, t.tok[idx], &st) && st.type_ == 2);
+            if (is_dir && !rec) {
+                kprintf("hata: '%s' bir dizin, silmek icin 'rm -r %s'\n", t.tok[idx], t.tok[idx]);
+            } else if (!fs::remove_file(cwd, t.tok[idx], rec)) {
+                kprintf("hata: silinemedi\n");
+            }
+        }
     }
     else if (strcmp(cmd, "lsfs") == 0)     cmd_lsfs();
     else if (strcmp(cmd, "pwd") == 0)      kprintf("%s\n", cwdstr);
@@ -293,6 +309,27 @@ bool run_line(char* line, uint32_t& cwd, char* cwdstr) {
         int pid = sched_spawn(nm);
         if (pid < 0) kprintf("hata: baslatilamadi (tablo dolu)\n");
         else kprintf("baslatildi pid=0x%04X (%d)\n", (uint16_t)pid, pid);
+    }
+    else if (strcmp(cmd, "run") == 0) {
+        if (t.n < 2) kprintf("kullanim: run <dosya.cexe>\n");
+        else {
+            char pathstr[64];
+            pathstr[0] = 0;
+            if (t.tok[1][0] != '/') {
+                strncpy(pathstr, cwdstr, 63);
+                int pl = (int)strlen(pathstr);
+                if (pl > 1 && pathstr[pl - 1] != '/') {
+                    pathstr[pl] = '/'; pathstr[pl + 1] = 0;
+                }
+                strncpy(pathstr + strlen(pathstr), t.tok[1], 63 - strlen(pathstr));
+            } else {
+                strncpy(pathstr, t.tok[1], 63);
+            }
+            pathstr[63] = 0;
+            int pid = sched_exec_file(pathstr);
+            if (pid < 0) kprintf("hata: %s calistirilamadi\n", pathstr);
+            else kprintf("baslatildi pid=0x%04X (%d)\n", (uint16_t)pid, pid);
+        }
     }
     else if (strcmp(cmd, "reboot") == 0) {
         kprintf("yeniden baslatiliyor...\n");

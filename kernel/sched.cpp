@@ -21,6 +21,7 @@ constexpr uint64_t USER_IMG_BASE    = 0x40000000ull;
 constexpr uint64_t USER_WINDOW_END  = 0x40020000ull;
 constexpr uint64_t USER_STACK_TOP   = 0x4001F000ull;   /* pencere - 1 sayfa koruma */
 constexpr int      USER_STACK_PAGES = 4;               /* 16KB */
+constexpr int      USER_CODE_MAX_PAGES = 256;          /* 1MB max kod/veri bolgesi */
 
 #ifndef USER_ENTRY_ADDR
 #define USER_ENTRY_ADDR USER_IMG_BASE
@@ -42,6 +43,8 @@ struct Process {
     uint64_t cr3;            /* prosese ozel PML4 (fiziksel) */
     uint64_t pml4, pdpt, pd, pt;            /* adres alani tablolari */
     uint64_t stk_pages[USER_STACK_PAGES];   /* kullanici yigini fiziksel sayfalari */
+    int      user_code_pages;               /* 0: paylasilan gomulu imaj; >0: ozel */
+    uint64_t code_frames[USER_CODE_MAX_PAGES];
     uint64_t waketick;
     uint64_t preempts;
     uint32_t exitcode;
@@ -145,8 +148,10 @@ void load_image(void) {
 
 /* Yeni adres alani: kernel kimlik 0..1GB (supervisor) + 2MB kullanici penceresi.
    f-cevreler: pml4[0]->pdpt; pdpt[0]=kernel PD (supervisor); pdpt[1]->pd;
-               pd[0]->pt; pt[] = imaj (RO paylasilan) + yigincik (RW ozel). */
-void vm_new(Process& p) {
+               pd[0]->pt; pt[] = imaj (RO paylasilan) + yigincik (RW ozel).
+   code_frames: yuklenecek kod sayfalari (fiziksel, pte'ye RW yazilir);
+   n_pages: kod sayfasi sayisi. NULL ise paylasilan gomulu imaj sayfalari. */
+void vm_build(Process& p, const uint64_t* code_frames, int n_pages) {
     p.pml4 = alloc_zero_frame();
     p.pdpt = alloc_zero_frame();
     p.pd   = alloc_zero_frame();
@@ -163,8 +168,16 @@ void vm_new(Process& p) {
     pdptp[1] = p.pd | 0x7;                /* 0x40000000-0x80000000 penceresi */
     pdp[0]   = p.pt | 0x7;
 
-    for (int i = 0; i < img_pages; i++)
-        pte[i] = img_frames[i] | 0x5;     /* P|U, salt-okunur (paylasilan kod) */
+    p.user_code_pages = n_pages;
+    if (code_frames) {
+        for (int i = 0; i < n_pages && i < USER_CODE_MAX_PAGES; i++) {
+            p.code_frames[i] = code_frames[i];
+            pte[i] = code_frames[i] | 0x5;     /* P|U, salt-okunur kod */
+        }
+    } else {
+        for (int i = 0; i < img_pages; i++)
+            pte[i] = img_frames[i] | 0x5;     /* P|U, salt-okunur (paylasilan) */
+    }
 
     for (int k = 0; k < USER_STACK_PAGES; k++) {
         uint64_t f = alloc_zero_frame();
@@ -176,7 +189,12 @@ void vm_new(Process& p) {
     p.cr3 = p.pml4;
 }
 
+void vm_new(Process& p) { vm_build(p, NULL, 0); }
+
 void vm_free(Process& p) {
+    if (p.user_code_pages > 0)                      /* prosese ozel kod sayfalari */
+        for (int i = 0; i < p.user_code_pages; i++)
+            if (p.code_frames[i]) { pmm_free_frame(p.code_frames[i]); p.code_frames[i] = 0; }
     for (int k = 0; k < USER_STACK_PAGES; k++)
         if (p.stk_pages[k]) { pmm_free_frame(p.stk_pages[k]); p.stk_pages[k] = 0; }
     if (p.pt)   { pmm_free_frame(p.pt);   p.pt = 0; }
@@ -187,17 +205,21 @@ void vm_free(Process& p) {
 }
 
 /* isr_common'un erteledigi frame: r15 push'tan iretq frame'ine kadar */
-uint64_t build_initial_context(Process& p) {
+uint64_t build_initial_context2(Process& p, uint64_t entry) {
     uint64_t* sp = (uint64_t*)(p.kstack + KSTACK_SIZE);
     *--sp = UDS;                        /* [21] ss        */
     *--sp = USER_STACK_TOP;             /* [20] usr rsp    */
     *--sp = 0x202;                      /* [19] rflags IF  */
     *--sp = UCS;                        /* [18] cs         */
-    *--sp = USER_ENTRY_ADDR;            /* [17] rip (elf giris noktasi) */
+    *--sp = entry;                      /* [17] rip */
     *--sp = 0;                          /* [16] err        */
     *--sp = 0;                          /* [15] vec        */
     for (int i = 14; i >= 0; i--) *--sp = 0;   /* [14..0] regler */
     return (uint64_t)sp;
+}
+
+uint64_t build_initial_context(Process& p) {
+    return build_initial_context2(p, USER_ENTRY_ADDR);
 }
 
 /* fork icin: ana surecin syscall anindaki register'ini kopyala, rax=0 (cocuk) */
@@ -259,10 +281,192 @@ extern "C" int sched_spawn(const char* name) {
     return (int)p.pid;
 }
 
+/* ---- gercek ELF exec: /sys bizim .cexe dosyalarini diskten okur,
+   segment'leri bellege kopyalar ve e_entry'den baslatir. ---- */
+
+/* ELF64 header/program-header sabitleri (extern header kutuphanesi yok) */
+#define ELF_MAGIC_B0 0x7F
+#define ELF_MAGIC_B1 'E'
+#define ELF_MAGIC_B2 'L'
+#define ELF_MAGIC_B3 'F'
+
+#define PT_LOAD    1
+
+struct __attribute__((packed)) Elf64_EhdrL {
+    uint8_t  ident[16];     /* 0  */
+    uint16_t type;          /* 16 */
+    uint16_t machine;       /* 18 */
+    uint32_t version;       /* 20 */
+    uint64_t entry;         /* 24 */
+    uint64_t phoff;         /* 32 */
+    uint64_t shoff;         /* 40 */
+    uint32_t flags;         /* 48 */
+    uint16_t ehsize;        /* 52 */
+    uint16_t phentsize;     /* 54 */
+    uint16_t phnum;         /* 56 */
+    uint16_t shstrndx;      /* 58 */
+};
+static_assert(sizeof(Elf64_EhdrL) == 60, "ehdr layout");
+
+struct __attribute__((packed)) Elf64_PhdrL {
+    uint32_t type;
+    uint32_t flags;
+    uint64_t offset;
+    uint64_t vaddr;
+    uint64_t paddr;
+    uint64_t filesz;
+    uint64_t memsz;
+    uint64_t align;
+};
+static_assert(sizeof(Elf64_PhdrL) == 56, "phdr layout");
+
+static bool elf_is_valid(const Elf64_EhdrL* eh) {
+    return eh->ident[0] == ELF_MAGIC_B0 && eh->ident[1] == ELF_MAGIC_B1 &&
+           eh->ident[2] == ELF_MAGIC_B2 && eh->ident[3] == ELF_MAGIC_B3;
+}
+
+static uint8_t elf_buf[16384];
+static uint32_t elf_len = 0;
+static uint64_t elf_entry = 0;
+
+/* ELF'i dogrula; PT_LOAD segment'lerine prosese ozel fiziksel sayfalar ayirip
+   iceriklerini kopyalar. code_frames[u]: fiziksel adres; user_code_pages:
+   ayrilan sayfa sayisi (son segment'in son sayfasi). Basarisizsa 0 doner ve
+   ayrilmis sayfalari birakir (cagiran vm_free ile temizler). */
+static bool elf_parse_and_load(uint64_t* code_frames, int* user_code_pages) {
+    Elf64_EhdrL* eh = (Elf64_EhdrL*)elf_buf;
+    if (elf_len < sizeof(Elf64_EhdrL)) return false;
+    if (!elf_is_valid(eh)) return false;
+    if (eh->phentsize < sizeof(Elf64_PhdrL) || !eh->phnum) return false;
+    elf_entry = eh->entry;
+
+    const uint8_t* phbase = elf_buf + eh->phoff;
+    int highest_vp = -1;
+
+    for (uint16_t pi = 0; pi < eh->phnum; pi++) {
+        const uint8_t* ph = phbase + (size_t)pi * eh->phentsize;
+        Elf64_PhdrL pr;
+        memcpy(&pr, ph, sizeof(pr));
+        if (pr.type != PT_LOAD) continue;
+        if (pr.memsz == 0) continue;
+
+        uint64_t va = pr.vaddr;
+        /* kullanici penceresini hic kapsamayan segmentleri atla (ornek:
+           gnu note LOAD'u 0x400000'da, bizim 0x40000000 penceremizin disinda) */
+        if (va + pr.memsz <= USER_IMG_BASE || va >= USER_WINDOW_END) continue;
+        if (va < USER_IMG_BASE || va + pr.memsz > USER_WINDOW_END) return false;
+
+        uint32_t vp_end = (uint32_t)(((va + pr.memsz - 1ull - USER_IMG_BASE) >> 12) + 1);
+        if (vp_end > (uint32_t)USER_CODE_MAX_PAGES) return false;
+        if ((int)vp_end > highest_vp) highest_vp = (int)vp_end;
+    }
+    if (highest_vp < 0) return false;
+
+    /* sayfalari ayir */
+    for (int i = 0; i <= highest_vp; i++) {
+        uint64_t f = alloc_zero_frame();
+        if (!f) { *user_code_pages = i; return false; }
+        code_frames[i] = f;
+    }
+    *user_code_pages = highest_vp + 1;
+
+    /* segment iceriklerini kopyala */
+    for (uint16_t pi = 0; pi < eh->phnum; pi++) {
+        const uint8_t* ph = phbase + (size_t)pi * eh->phentsize;
+        Elf64_PhdrL pr;
+        memcpy(&pr, ph, sizeof(pr));
+        if (pr.type != PT_LOAD || pr.memsz == 0) continue;
+
+        uint64_t va     = pr.vaddr;
+        if (va + pr.memsz <= USER_IMG_BASE || va >= USER_WINDOW_END) continue;
+        uint64_t voff0  = va - USER_IMG_BASE;   /* va >= USER_IMG_BASE oldugundan guvenli */
+        uint64_t src    = pr.offset;
+        uint64_t filesz = pr.filesz;
+        uint64_t memsz  = pr.memsz;
+        uint32_t vp_start = (uint32_t)(voff0 >> 12);
+        uint32_t vp_end   = (uint32_t)(((voff0 + memsz - 1) >> 12) + 1);
+
+        for (uint32_t vp = vp_start; vp < vp_end; vp++) {
+            uint8_t* page = (uint8_t*)code_frames[vp];
+            memset(page, 0, 4096);
+            uint64_t page_voff = (uint64_t)vp * 4096ull;
+            for (uint64_t off = 0; off < 4096; off++) {
+                uint64_t abs_off = (page_voff + off) - voff0;
+                if (abs_off >= memsz) break;
+                if (abs_off < filesz) {
+                    uint64_t file_off = src + abs_off;
+                    if (file_off < elf_len)
+                        page[off] = elf_buf[file_off];
+                }
+            }
+        }
+    }
+    return true;
+}
+
+extern "C" int sched_exec_file(const char* path) {
+    if (!sched_ready && cur) return -1;      /* exec yalniz kullanicidan */
+
+    elf_len = 0;
+    if (!fs::read_file(0, path, elf_buf, sizeof(elf_buf), &elf_len)) return -1;
+    if (elf_len < sizeof(Elf64_EhdrL)) return -1;
+
+    /* kac sayfa lazim oldugunu bellekte bul, ayir */
+    Elf64_EhdrL* eh = (Elf64_EhdrL*)elf_buf;
+    if (!elf_is_valid(eh)) return -1;
+
+    int i = find_hole();
+    if (i < 0) return -1;
+    void* k = kmalloc(KSTACK_SIZE);
+    if (!k) return -1;
+    int pid = pid_alloc();
+    if (pid < 0) { kfree(k); return -1; }
+
+    Process& p = table[i];
+    memset(&p, 0, sizeof(p));
+    p.pid      = (uint16_t)pid;
+    p.state    = P_READY;
+    p.kstack   = (uint64_t)k;
+
+    const char* nm = path;
+    const char* slash = strrchr(path, '/');
+    if (slash) nm = slash + 1;
+    int nl = (int)strlen(nm);
+    if (nl > 14) nl = 14;
+    memcpy(p.name, nm, (size_t)nl);
+    p.name[nl] = 0;
+
+    /* once tablolari kur (hata olursa geri al) */
+    p.pml4 = alloc_zero_frame();
+    p.pdpt = alloc_zero_frame();
+    p.pd   = alloc_zero_frame();
+    p.pt   = alloc_zero_frame();
+    p.user_code_pages = 0;
+    if (!p.pml4 || !p.pdpt || !p.pd || !p.pt) {
+        kslog("exec: adres alani ayrilamadi (%s)\n", path);
+        vm_free(p);
+        kfree(k);
+        p.state = P_EMPTY; p.pid = 0;
+        return -1;
+    }
+    if (!elf_parse_and_load(p.code_frames, &p.user_code_pages)) {
+        kslog("exec: ELF yuklenemedi (%s)\n", path);
+        vm_free(p);
+        kfree(k);
+        p.state = P_EMPTY; p.pid = 0;
+        return -1;
+    }
+
+    vm_build(p, p.code_frames, p.user_code_pages);
+    if (!p.cr3) { kfree(k); p.state = P_EMPTY; p.pid = 0; return -1; }
+
+    p.ctx = build_initial_context2(p, elf_entry);
+    return (int)p.pid;
+}
+
 extern "C" uint64_t sched_tick(uint64_t ctx) {
     return sched_reschedule(ctx);
 }
-
 extern "C" uint64_t sched_reschedule(uint64_t ctx) {
     Process* self = cur;
     wake_sleepers();

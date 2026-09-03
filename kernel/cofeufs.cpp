@@ -199,12 +199,12 @@ static bool dir_add(uint32_t dirino, const char* name, uint32_t newino, uint16_t
     inode_read(dirino, d);
     if (d.type != FT_DIR) return false;
 
-    /* bos slot var mi? */
+    /* bos slot var mi? (ino==0 VE isim bos; ".." root'a ino==0 isaret edebilir) */
     uint32_t n = dir_used(d);
     for (uint32_t i = 0; i < n; i++) {
         DirEntry e;
         if (!dir_slot_read(d, i, e)) break;
-        if (e.ino == 0) {
+        if (e.ino == 0 && e.name[0] == 0) {
             e.ino = newino;
             e.type = (uint8_t)type;
             strncpy(e.name, name, 31);
@@ -363,6 +363,18 @@ static bool format(void) {
 /* ---- cocuk inode'u degilsek, recursive silme - */
 static void remove_inode_by_ino(uint32_t ino, bool recursive);
 
+/* ---- varsayilan sistem dizinleri: temp (tmpvar), sys (sistem/elf),
+   uspc (kullanicinin yonetebildigi bolge). Ilk kurulumda ve eksikse olusur. */
+static bool ensure_system_dirs(void) {
+    static const char* dirs[3] = { "temp", "sys", "uspc" };
+    for (int i = 0; i < 3; i++) {
+        uint32_t ino;
+        if (resolve(0, dirs[i], &ino)) continue;      /* zaten var */
+        if (!mkdir(0, dirs[i])) return false;
+    }
+    return true;
+}
+
 /* ---- genel API ---- */
 bool mount(void) {
     if (!read_super()) {
@@ -372,6 +384,7 @@ bool mount(void) {
     }
     bm_read();
     mounted = true;
+    ensure_system_dirs();
     return true;
 }
 

@@ -19,7 +19,8 @@ LDFLAGS   = -m elf_x86_64 -T linker.ld -nostdlib -z max-page-size=0x1000
 OBJ = kernel/entry.o kernel/isr.o kernel/main.o kernel/util.o kernel/memory.o \
       kernel/pmm.o kernel/kprintf.o kernel/vga.o kernel/serial.o kernel/gdt.o \
       kernel/idt.o kernel/irq.o kernel/timer.o kernel/keyboard.o kernel/ata.o \
-      kernel/cofeufs.o kernel/shell.o kernel/sched.o kernel/user_embed.o
+      kernel/cofeufs.o kernel/shell.o kernel/sched.o kernel/user_embed.o \
+      kernel/elf_embed.o
 
 DISK_SIZE_SECTORS = 67584
 
@@ -48,6 +49,9 @@ user/user_demo.bin: user/user_demo.elf
 	@echo "user entry: $$(readelf -h $< | grep 'Entry point' | sed -n 's/.*\(0x[0-9a-fA-F]*\).*/\1/p')"
 
 kernel/user_embed.o: user/user_demo.bin
+	$(LD) -r -b binary $< -o $@
+
+kernel/elf_embed.o: user/user_demo.elf
 	$(LD) -r -b binary $< -o $@
 
 kernel/sched.o: kernel/sched.cpp user/user_demo.elf
