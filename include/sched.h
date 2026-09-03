@@ -13,6 +13,14 @@
 #define SYS_PUTSN     7
 #define SYS_FORK      8
 #define SYS_GETNAME   9
+#define SYS_FSWRITE  10   /* write_file  (mutlak yol) : a0=yol a1=veri a2=len */
+#define SYS_FSAPPEND 11   /* append_file (mutlak yol) : a0=yol a1=veri a2=len */
+#define SYS_FSREAD   12   /* read_file   (mutlak yol) : a0=yol a1=buf a2=maxlen */
+#define SYS_FSSTAT   13   /* stat: a0=yol a1=EntryInfo* -> rax=boyut, tip rc */
+#define SYS_GETCH    14   /* a0=1: bu yana kuyrukta karakter var mi? rax=1/0 */
+#define SYS_FSGETC   15   /* stdin (klavye+serial) tek karakter, yoksa -1 */
+#define SYS_WAIT     16   /* a0=child pid (0=herhangi) -> rax=exit code, -1 yok */
+#define SYS_EXEC     17   /* a0=yol: bu sureci elfla degistir (execve) */
 
 extern "C" {
 
@@ -20,6 +28,7 @@ void   sched_init(void);
 void   sched_go(void);                       /* spawn'lardan sonra cagrilir */
 int    sched_spawn(const char* name);
 int    sched_exec_file(const char* path);    /* diskten ELF calistir (run) */
+uint64_t sched_exec_self(uint64_t ctx, const char* path); /* bu sureci elfla degistir */
 uint64_t sched_tick(uint64_t ctx);   /* zamanlayici: dondurdugu ctx'e gecilir */
 uint64_t sched_reschedule(uint64_t ctx);
 uint64_t syscall_handle(uint64_t ctx);

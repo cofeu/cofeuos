@@ -133,6 +133,17 @@ bool uaddr_ok(uint64_t a, uint64_t n) {
            a + n <= USER_WINDOW_END;
 }
 
+/* kullanici penceresinden NUL sonlu yolu (max 95 bayt) kernel tamponuna kopyalar. */
+bool copy_user_path(uint64_t src, char* out, int maxlen) {
+    if (!uaddr_ok(src, maxlen)) return false;
+    const char* s = (const char*)src;
+    for (int i = 0; i < maxlen; i++) {
+        if (s[i] == 0) { out[i] = 0; return true; }
+        out[i] = s[i];
+    }
+    return false;                         /* sonlandirilmamis */
+}
+
 /* gomulu kullanici imajini bir kez PMM'e kopyala; tum prosesler paylasir */
 void load_image(void) {
     uint64_t start = (uint64_t)_binary_user_user_demo_bin_start;
@@ -464,6 +475,49 @@ extern "C" int sched_exec_file(const char* path) {
     return (int)p.pid;
 }
 
+/* execve: BU surecin adres alanini diskteki ELF ile degistirir. pid/name/kstack
+   ayni kalir; eski imaj serbest birakilir, yenisi kurulur ve e_entry'den
+   devam edilir. Donen ctx yeni baslangic frame'idir (exec hic donmez). */
+extern "C" uint64_t sched_exec_self(uint64_t ctx, const char* path) {
+    if (!cur) return ctx;
+    Process* self = cur;
+    kslog("exec-self: %s pid=%d\n", path, self->pid);
+
+    elf_len = 0;
+    if (!fs::read_file(0, path, elf_buf, sizeof(elf_buf), &elf_len)) return ctx;
+    if (elf_len < sizeof(Elf64_EhdrL)) return ctx;
+    Elf64_EhdrL* eh = (Elf64_EhdrL*)elf_buf;
+    if (!elf_is_valid(eh)) return ctx;
+
+    /* yeni adres alanini ayri bir Process'te (bellek alanlari) OLUMSUZ
+       calisirken kur; basarisizlik olursa eski imaj bozulmadan kalir. */
+    Process np;
+    memset(&np, 0, sizeof(np));
+    np.pml4 = alloc_zero_frame();
+    np.pdpt = alloc_zero_frame();
+    np.pd   = alloc_zero_frame();
+    np.pt   = alloc_zero_frame();
+    np.user_code_pages = 0;
+    if (!np.pml4 || !np.pdpt || !np.pd || !np.pt) { vm_free(np); return ctx; }
+    if (!elf_parse_and_load(np.code_frames, &np.user_code_pages)) { vm_free(np); return ctx; }
+    vm_build(np, np.code_frames, np.user_code_pages);
+    if (!np.cr3) { vm_free(np); return ctx; }
+
+    /* eski imaji serbest birak, yeni adres alanini ana surece tasi */
+    vm_free(*self);
+    self->pml4 = np.pml4; self->pdpt = np.pdpt;
+    self->pd   = np.pd;   self->pt   = np.pt;
+    self->cr3  = np.cr3;
+    self->user_code_pages = np.user_code_pages;
+    for (int i = 0; i < USER_CODE_MAX_PAGES; i++) self->code_frames[i] = np.code_frames[i];
+    for (int k = 0; k < USER_STACK_PAGES; k++)    self->stk_pages[k]   = np.stk_pages[k];
+
+    self->ctx = build_initial_context2(*self, elf_entry);
+    kslog("exec-self: OK pid=%d entry=0x%llx\n", self->pid,
+          (unsigned long long)elf_entry);
+    return self->ctx;
+}
+
 extern "C" uint64_t sched_tick(uint64_t ctx) {
     return sched_reschedule(ctx);
 }
@@ -512,7 +566,7 @@ extern "C" uint64_t sched_reschedule(uint64_t ctx) {
 extern "C" uint64_t syscall_handle(uint64_t ctx) {
     uint64_t* r = (uint64_t*)ctx;
     uint64_t n  = r[OFF_RAX];
-    uint64_t a0 = r[OFF_RDI], a1 = r[OFF_RSI];
+    uint64_t a0 = r[OFF_RDI], a1 = r[OFF_RSI], a2 = r[OFF_RDX];
 
     if (!cur) { r[OFF_RAX] = (uint64_t)-1; return ctx; }
 
@@ -596,6 +650,74 @@ extern "C" uint64_t syscall_handle(uint64_t ctx) {
         for (int i = 0; i < 15; i++) dst[i] = cur->name[i];   /* NUL dolgulu */
         r[OFF_RAX] = 0;
         break;
+    }
+    case SYS_FSWRITE:
+    case SYS_FSAPPEND: {
+        char path[96];
+        if (!copy_user_path(a0, path, sizeof(path)) ||
+            a2 > 2048 || !uaddr_ok(a1, a2)) { r[OFF_RAX] = (uint64_t)-1; break; }
+        bool ok = (n == SYS_FSWRITE)
+                  ? fs::write_file(0, path, (const void*)a1, (uint32_t)a2)
+                  : fs::append_file(0, path, (const void*)a1, (uint32_t)a2);
+        r[OFF_RAX] = ok ? (uint64_t)a2 : (uint64_t)-1;
+        break;
+    }
+    case SYS_FSREAD: {
+        char path[96];
+        if (!copy_user_path(a0, path, sizeof(path)) ||
+            !uaddr_ok(a1, a2) || a2 > 4096) { r[OFF_RAX] = (uint64_t)-1; break; }
+        uint32_t got = 0;
+        bool ok = fs::read_file(0, path, (void*)a1, (uint32_t)a2, &got);
+        r[OFF_RAX] = ok ? (uint64_t)got : (uint64_t)-1;
+        break;
+    }
+    case SYS_FSSTAT: {
+        char path[96];
+        if (!copy_user_path(a0, path, sizeof(path)) ||
+            !uaddr_ok(a1, sizeof(fs::EntryInfo))) { r[OFF_RAX] = (uint64_t)-1; break; }
+        fs::EntryInfo st;
+        if (!fs::stat(0, path, &st)) { r[OFF_RAX] = (uint64_t)-1; break; }
+        fs::EntryInfo* d = (fs::EntryInfo*)a1;
+        d->type_ = st.type_;
+        d->size_ = st.size_;
+        for (int i = 0; i < 32; i++) d->name_[i] = st.name_[i];
+        r[OFF_RAX] = 0;
+        break;
+    }
+    case SYS_GETCH: {
+        bool any = keyboard_has_char() || serial_has_char();
+        r[OFF_RAX] = any ? 1 : 0;
+        break;
+    }
+    case SYS_FSGETC: {
+        char c;
+        if (keyboard_has_char())                       c = keyboard_getc();
+        else if (serial_has_char())                    c = serial_getc();
+        else { r[OFF_RAX] = (uint64_t)-1; break; }
+        r[OFF_RAX] = (uint8_t)c;
+        break;
+    }
+    case SYS_WAIT: {
+        uint16_t want = (uint16_t)a0;
+        int found = -1;
+        for (int i = 0; i < MAX_PROC; i++) {
+            Process& q = table[i];
+            if (q.state != P_ZOMBIE) continue;
+            if (want && q.pid != want) continue;
+            found = i; break;
+        }
+        if (found < 0) { r[OFF_RAX] = (uint64_t)-1; break; }
+        r[OFF_RAX] = table[found].exitcode;
+        vm_free(table[found]);
+        if (table[found].kstack) kfree((void*)table[found].kstack);
+        table[found].state = P_EMPTY;
+        table[found].pid   = 0;
+        break;
+    }
+    case SYS_EXEC: {
+        char path[96];
+        if (!copy_user_path(a0, path, sizeof(path))) { r[OFF_RAX] = (uint64_t)-1; break; }
+        return sched_exec_self(ctx, path);      /* surecin imajini degistir, donmez */
     }
     default:
         r[OFF_RAX] = (uint64_t)-1;

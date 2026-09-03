@@ -19,8 +19,7 @@ LDFLAGS   = -m elf_x86_64 -T linker.ld -nostdlib -z max-page-size=0x1000
 OBJ = kernel/entry.o kernel/isr.o kernel/main.o kernel/util.o kernel/memory.o \
       kernel/pmm.o kernel/kprintf.o kernel/vga.o kernel/serial.o kernel/gdt.o \
       kernel/idt.o kernel/irq.o kernel/timer.o kernel/keyboard.o kernel/ata.o \
-      kernel/cofeufs.o kernel/shell.o kernel/sched.o kernel/user_embed.o \
-      kernel/elf_embed.o
+      kernel/cofeufs.o kernel/shell.o kernel/sched.o kernel/user_embed.o 
 
 DISK_SIZE_SECTORS = 67584
 
@@ -51,8 +50,8 @@ user/user_demo.bin: user/user_demo.elf
 kernel/user_embed.o: user/user_demo.bin
 	$(LD) -r -b binary $< -o $@
 
-kernel/elf_embed.o: user/user_demo.elf
-	$(LD) -r -b binary $< -o $@
+user/user2.elf: user2/user2.c
+	$(CC) $(USERFLAGS) -o $@ $<
 
 kernel/sched.o: kernel/sched.cpp user/user_demo.elf
 	$(CXX) $(CXXFLAGS) -DUSER_ENTRY_ADDR=$$(readelf -h user/user_demo.elf | grep 'Entry point' | sed -n 's/.*\(0x[0-9a-fA-F]*\).*/\1/p') -c -o $@ $<
@@ -70,10 +69,13 @@ kernel.bin: kernel.elf
 	    exit 1; \
 	fi
 
-disk.img: boot/boot.bin kernel.bin
+disk.img: boot/boot.bin kernel.bin user/user_demo.elf user/user2.elf tools/mkfs.py
 	truncate -s $$((67584 * 512)) $@
 	dd if=boot/boot.bin of=$@ conv=notrunc status=none
 	dd if=kernel.bin of=$@ bs=512 seek=1 conv=notrunc status=none
+	python3 tools/mkfs.py $@ \
+	    user/user_demo.elf:/sys/basic.cexe \
+	    user/user2.elf:/sys/hello.cexe
 
 run: disk.img
 	$(QEMU) -drive file=disk.img,format=raw,cache=writethrough,index=0 \
@@ -85,4 +87,4 @@ run-headless: disk.img
 
 clean:
 	rm -f kernel.elf kernel.bin disk.img boot/boot.bin
-	rm -f kernel/*.o user/user_demo.elf user/user_demo.bin
+	rm -f kernel/*.o user/user_demo.elf user/user_demo.bin user/user2.elf

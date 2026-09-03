@@ -3,9 +3,8 @@
 #include "pmm.h"
 #include "sched.h"
 
-/* gomulu ornek ELF: /sys/basic.cexe olarak diske kopyalanir (run komutu icin) */
-extern "C" char _binary_user_user_demo_elf_start[];
-extern "C" char _binary_user_user_demo_elf_end[];
+/* Uygulamalar (/sys/*.cexe) derleme aninda tools/mkfs.py ile disk.img'ye
+   yazilir; kernel.bin'de ELF gommek boot 127-sektor limitini asardi. */
 
 extern "C" void kernel_main(void) {
     vga_init();
@@ -42,15 +41,6 @@ extern "C" void kernel_main(void) {
         kslog("fs mount=%d\n", mnt ? 1 : 0);
         if (mnt) {
             fs::selftest();
-            /* ornek uygulamayi /sys'e yaz: run komutu diskten calistirir */
-            fs::EntryInfo st;
-            if (!fs::stat(0, "/sys/basic.cexe", &st)) {
-                uint64_t esz = (uint64_t)(_binary_user_user_demo_elf_end -
-                                          _binary_user_user_demo_elf_start);
-                bool w = fs::write_file(0, "/sys/basic.cexe",
-                                        _binary_user_user_demo_elf_start, (uint32_t)esz);
-                kslog("basic.cexe yazildi=%d boyut=%lu\n", w ? 1 : 0, esz);
-            }
         }
     }
 

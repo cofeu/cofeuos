@@ -5,3 +5,7 @@ kernel/*.o
 boot/boot.bin
 user/user_demo.elf
 user/user_demo.bin
+user/user2.elf
+user/user_io.elf
+user/user_io.c
+__pycache__/

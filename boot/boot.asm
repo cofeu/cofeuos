@@ -157,6 +157,13 @@ print:
     ret
 
 ; ----------------------------------------------------------------------------
+; load_kernel: kerneli LBA 1..KERNEL_SECTORS -> ara tampona parcali okur.
+;  Her Int13h cagrisi en fazla 127 sektordur (EDD tek-okuma siniri); boylece
+;  kernel boyutu 127*512 = 65024 bayt ile sinirli kalmaz.
+;  Ara tampon: STAGE_ADDR'den baslayarak ardisi dilimlere yazilir.
+;  Cagiran: uzak adresle son MB'ye kopyalar (KERNEL_SECTORS*512 bayt).
+; ----------------------------------------------------------------------------
+; ----------------------------------------------------------------------------
 ; load_kernel: LBA 1..KERNEL_SECTORS -> STAGE_ADDR (tek Int13h okuma)
 ;  (KERNEL_SECTORS <= 127 oldugu surece gecerlidir)
 ; ----------------------------------------------------------------------------
@@ -166,6 +173,7 @@ load_kernel:
     mov si, dap
     int 0x13
     ret                     ; CF = BIOS hata bayragi
+
 
 halt:
     cli
