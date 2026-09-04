@@ -38,7 +38,11 @@ void  kprintf(const char* fmt, ...);
 void  kslog(const char* fmt, ...);
 int   ksnprintf(char* buf, size_t n, const char* fmt, ...);
 
-/* bellek albkatoforu: pmm arena uzerinde free-list (operator new/delete ile) */
+/* Yonlendirme (cmd > dosya): kprintf ciktisini VGA yerine tampona alir. */
+int   output_capture_begin(char* buf, size_t cap, int* len);
+void  output_capture_end(void);
+
+/* bellek allocateoru: pmm arena uzerinde free-list (operator new/delete ile) */
 void kmalloc_init(void);
 void* kmalloc(size_t n);
 void kfree(void* p);
@@ -51,7 +55,7 @@ void vga_putc(char c);
 void vga_write(const char* s);
 void vga_set_cursor(uint8_t x, uint8_t y);
 
-/* ---- COM1 su]rial ---- */
+/* ---- COM1 serial ---- */
 void serial_init(void);
 void serial_putc(char c);
 void serial_write(const char* s);

@@ -7,8 +7,9 @@
    yazilir; kernel.bin'de ELF gommek boot 127-sektor limitini asardi. */
 
 extern "C" void kernel_main(void) {
-    vga_init();
     serial_init();
+    kslog("cofeuos: kernel entry\n");
+    vga_init();
 
     kslog("cofeuos 0.1 boot\n");
     kprintf("cofeuos 0.1.0 - x86_64 boot ediliyor...\n");

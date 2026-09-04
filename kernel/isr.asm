@@ -116,4 +116,4 @@ isr_stub_table:
 %assign i i+1
 %endrep
 
-section .note.GNU-stack noalloc noexec nowrite progbits
+section .note.cofeu-stack noalloc noexec nowrite progbits

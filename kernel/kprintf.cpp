@@ -85,7 +85,7 @@ void vformat(emit_fn emit, void* ctx, const char* fmt, va_list ap) {
         case 'u': break;
         case 'x': base = 16; break;
         case 'X': base = 16; upper = true; break;
-        case 'p': base = 16; upper = true; break;
+        case 'p': base = 16; upper = false; emit('0', ctx); emit('x', ctx); break;
         case 'b': base = 2; break;
         default:
             emit('%', ctx);
@@ -121,13 +121,51 @@ void emit_serial(char c, void*) {
     serial_putc(c);
 }
 
+/* ---- cikti yakalama: komut yonlendirmesi (cmd > dosya / >> dosya) ----
+   kprintf bu modda VGA yerine tampona yazar; bos NULL ise tampona yazilmaz. */
+struct CaptureState {
+    char*  buf;
+    char*  end;
+    int*   len;
+};
+CaptureState g_cap;
+bool g_capturing = false;
+
+void emit_capture(char c, void* ctx) {
+    CaptureState* s = (CaptureState*)ctx;
+    if (s->buf && s->buf < s->end) *s->buf++ = c;
+    if (s->len) (*s->len)++;
+}
+
 } /* namespace */
 
 extern "C" void kprintf(const char* fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    vformat(emit_vga_serial, NULL, fmt, ap);
+    if (g_capturing) {
+        vformat(emit_capture, &g_cap, fmt, ap);
+    } else {
+        vformat(emit_vga_serial, NULL, fmt, ap);
+    }
     va_end(ap);
+}
+
+/* Yonlendirme tamponunu ac; tum kprintf ciktisi buf[0..cap-1]'e yazilir,
+   len cikti uzunlugunu alir. */
+extern "C" int output_capture_begin(char* buf, size_t cap, int* len) {
+    g_cap.buf = buf;
+    g_cap.end = buf + cap;
+    g_cap.len = len;
+    if (len) *len = 0;
+    g_capturing = true;
+    return 0;
+}
+
+extern "C" void output_capture_end(void) {
+    g_capturing = false;
+    g_cap.buf = NULL;
+    g_cap.end = NULL;
+    g_cap.len = NULL;
 }
 
 extern "C" void kslog(const char* fmt, ...) {

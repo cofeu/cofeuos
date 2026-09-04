@@ -35,6 +35,7 @@ uint64_t syscall_handle(uint64_t ctx);
 uint64_t sched_userpf_kill(uint64_t ctx);
 void   sched_list(void);
 int    sched_kill(uint16_t pid);
+int    sched_wait(uint16_t pid);
 int    sched_count(void);
 
 }

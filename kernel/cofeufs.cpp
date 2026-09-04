@@ -280,6 +280,7 @@ static bool resolve_from(uint32_t base, const char* path, uint32_t* out) {
         if (!dir_find(d, comp, e, slot)) return false;
         cur = e.ino;
     }
+    return false;
 }
 
 /* /parent/name ayirimi; parent inode = parent. Mutlak yollar kokten cozulur. */

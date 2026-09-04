@@ -16,6 +16,16 @@ _start:
     db 'COFEUOS!'                  ; 8 byte, LBA1'in ilk 8 byte'i = magic
 
     cli
+    ; ---- tanilama: seri isaretleri ('K' entry'de) ----
+    mov dx, 0x3FD
+._w0:
+    in al, dx
+    test al, 0x20
+    jz ._w0
+    mov dx, 0x3F8
+    mov al, 'K'
+    out dx, al
+
     mov ax, 0x10
     mov ss, ax
     mov ds, ax
@@ -39,4 +49,4 @@ _start:
     hlt
     jmp .hlt
 
-section .note.GNU-stack noalloc noexec nowrite progbits
+section .note.cofeu-stack noalloc noexec nowrite progbits

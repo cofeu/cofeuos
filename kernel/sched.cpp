@@ -48,6 +48,7 @@ struct Process {
     uint64_t waketick;
     uint64_t preempts;
     uint32_t exitcode;
+    uint64_t start_tick;        /* baslangic tick'i (calisma suresi hesabi) */
 };
 
 Process     table[MAX_PROC];
@@ -288,6 +289,7 @@ extern "C" int sched_spawn(const char* name) {
     vm_new(p);
     if (!p.cr3) { kfree(k); p.state = P_EMPTY; p.pid = 0; return -1; }
 
+    p.start_tick = timer_get_ticks();
     p.ctx = build_initial_context(p);
     return (int)p.pid;
 }
@@ -340,6 +342,24 @@ static uint8_t elf_buf[16384];
 static uint32_t elf_len = 0;
 static uint64_t elf_entry = 0;
 
+/* ELF icinde cofeu cexe imza notunu (.note.cofeu) ara.
+   ELF note kafasi + govde: namesz=8, descsz=8, type=0xC0FE,
+   name="COFEUOS\0", desc="COFEU..."  -- tumu bayt dizisi olarak. */
+static bool elf_has_cofeu_note(void) {
+    if (elf_len < 24) return false;
+    for (uint32_t off = 0; off + 24 <= elf_len; off++) {
+        const uint8_t* p = elf_buf + off;
+        if (p[0] == 8  && p[1] == 0 && p[2] == 0 && p[3] == 0 &&
+            p[4] == 8  && p[5] == 0 && p[6] == 0 && p[7] == 0 &&
+            p[8] == 0xFE && p[9] == 0xC0 && p[10] == 0 && p[11] == 0 &&
+            p[12] == 'C' && p[13] == 'O' && p[14] == 'F' && p[15] == 'E' &&
+            p[16] == 'U' && p[17] == 'O' && p[18] == 'S' && p[19] == 0 &&
+            p[20] == 'C' && p[21] == 'O' && p[22] == 'F' && p[23] == 'E')
+            return true;
+    }
+    return false;
+}
+
 /* ELF'i dogrula; PT_LOAD segment'lerine prosese ozel fiziksel sayfalar ayirip
    iceriklerini kopyalar. code_frames[u]: fiziksel adres; user_code_pages:
    ayrilan sayfa sayisi (son segment'in son sayfasi). Basarisizsa 0 doner ve
@@ -363,7 +383,7 @@ static bool elf_parse_and_load(uint64_t* code_frames, int* user_code_pages) {
 
         uint64_t va = pr.vaddr;
         /* kullanici penceresini hic kapsamayan segmentleri atla (ornek:
-           gnu note LOAD'u 0x400000'da, bizim 0x40000000 penceremizin disinda) */
+           not LOAD'u 0x400000'da, bizim 0x40000000 penceremizin disinda) */
         if (va + pr.memsz <= USER_IMG_BASE || va >= USER_WINDOW_END) continue;
         if (va < USER_IMG_BASE || va + pr.memsz > USER_WINDOW_END) return false;
 
@@ -416,15 +436,28 @@ static bool elf_parse_and_load(uint64_t* code_frames, int* user_code_pages) {
 }
 
 extern "C" int sched_exec_file(const char* path) {
-    if (!sched_ready && cur) return -1;      /* exec yalniz kullanicidan */
+    if (!sched_ready && cur) { kslog("exec: kernel modda\n"); return -1; }
 
     elf_len = 0;
-    if (!fs::read_file(0, path, elf_buf, sizeof(elf_buf), &elf_len)) return -1;
-    if (elf_len < sizeof(Elf64_EhdrL)) return -1;
+    if (!fs::read_file(0, path, elf_buf, sizeof(elf_buf), &elf_len)) {
+        kslog("exec: dosya okunamadi: %s\n", path);
+        return -1;
+    }
+    if (elf_len < sizeof(Elf64_EhdrL)) {
+        kslog("exec: elf cok kucuk (%u): %s\n", elf_len, path);
+        return -1;
+    }
 
     /* kac sayfa lazim oldugunu bellekte bul, ayir */
     Elf64_EhdrL* eh = (Elf64_EhdrL*)elf_buf;
-    if (!elf_is_valid(eh)) return -1;
+    if (!elf_is_valid(eh)) {
+        kslog("exec: elf magically gecersiz: %s\n", path);
+        return -1;
+    }
+    if (!elf_has_cofeu_note()) {
+        kslog("exec: cofeu notu yok (%u bayt): %s\n", elf_len, path);
+        return -1;
+    }
 
     int i = find_hole();
     if (i < 0) return -1;
@@ -471,6 +504,7 @@ extern "C" int sched_exec_file(const char* path) {
     vm_build(p, p.code_frames, p.user_code_pages);
     if (!p.cr3) { kfree(k); p.state = P_EMPTY; p.pid = 0; return -1; }
 
+    p.start_tick = timer_get_ticks();
     p.ctx = build_initial_context2(p, elf_entry);
     return (int)p.pid;
 }
@@ -488,7 +522,10 @@ extern "C" uint64_t sched_exec_self(uint64_t ctx, const char* path) {
     if (elf_len < sizeof(Elf64_EhdrL)) return ctx;
     Elf64_EhdrL* eh = (Elf64_EhdrL*)elf_buf;
     if (!elf_is_valid(eh)) return ctx;
-
+    if (!elf_has_cofeu_note()) {
+        kslog("exec-self: cofeu imzasi yok (%s)\n", path);
+        return ctx;
+    }
     /* yeni adres alanini ayri bir Process'te (bellek alanlari) OLUMSUZ
        calisirken kur; basarisizlik olursa eski imaj bozulmadan kalir. */
     Process np;
@@ -736,7 +773,8 @@ extern "C" uint64_t sched_userpf_kill(uint64_t ctx) {
 }
 
 extern "C" void sched_list(void) {
-    kprintf("PID    HEX   ST NAME           PRM\n");
+    kprintf("PID    HEX   ST NAME           PRM  TIME  MEM(KB)  EXIT\n");
+    uint64_t now = timer_get_ticks();
     for (int i = 0; i < MAX_PROC; i++) {
         const Process& p = table[i];
         const char* st = "????";
@@ -747,8 +785,12 @@ extern "C" void sched_list(void) {
         case P_ZOMBIE:   st = "Z"; break;
         default:         continue;
         }
-        kprintf("%-5u 0x%04X  %-2s %-14s %lu\n",
-                p.pid, p.pid, st, p.name, (unsigned long)p.preempts);
+        uint32_t memkb = (uint32_t)(p.user_code_pages + USER_STACK_PAGES + 4) * 4u;
+        uint64_t secs  = (now - p.start_tick) / 100u;
+        if (p.state == P_ZOMBIE) secs = 0;
+        kprintf("%-5u 0x%04X  %-2s %-14s %-4lu %5llus  %6u    %lu\n",
+                p.pid, p.pid, st, p.name, (unsigned long)p.preempts,
+                (unsigned long long)secs, memkb, (unsigned long)p.exitcode);
     }
 }
 
@@ -762,6 +804,21 @@ extern "C" int sched_kill(uint16_t pid) {
     p.state = P_EMPTY;
     p.pid   = 0;
     return 0;
+}
+
+extern "C" int sched_wait(uint16_t pid) {
+    for (int i = 0; i < MAX_PROC; i++) {
+        Process& q = table[i];
+        if (q.state != P_ZOMBIE) continue;
+        if (pid && q.pid != pid) continue;
+        int ec = (int)q.exitcode;
+        vm_free(q);
+        if (q.kstack) kfree((void*)q.kstack);
+        q.state = P_EMPTY;
+        q.pid   = 0;
+        return ec;
+    }
+    return -1;
 }
 
 extern "C" int sched_count(void) {

@@ -10,6 +10,7 @@ volatile int tail = 0;
 
 bool shift = false;
 bool caps = false;
+bool extended = false;
 
 static const char normal[128] = {
     0, 27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
@@ -39,26 +40,40 @@ void push(char c) {
 } /* namespace */
 
 extern "C" void keyboard_init(void) {
-    /* PS/2 denetleyiciyi kullanilabilir segi: port 0x60/0x64 otomatik */
     head = tail = 0;
     shift = false;
     caps = false;
+    extended = false;
 }
 
 extern "C" void keyboard_irq(void) {
     uint8_t code = inb(0x60);
+
+    if (code == 0xE0) { extended = true; return; }
+
     bool released = (code & 0x80) != 0;
     uint8_t sc = code & 0x7F;
 
     if (released) {
+        if (extended) { extended = false; return; }
         if (sc == 0x2A || sc == 0x36) shift = false;
         return;
+    }
+
+    if (extended) {
+        extended = false;
+        switch (sc) {
+        case 0x48: push((char)0x80); return;
+        case 0x50: push((char)0x81); return;
+        case 0x4B: push((char)0x82); return;
+        case 0x4D: push((char)0x83); return;
+        default: return;
+        }
     }
 
     switch (sc) {
     case 0x2A: case 0x36: shift = true; return;
     case 0x3A: caps = !caps; return;
-    case 0x60: return;   /* 0xE0 genisetilmis prefix */
     default: break;
     }
 
