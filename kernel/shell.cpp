@@ -61,6 +61,7 @@ const char* HELP =
     "  dhcp                     - DHCP ile IP iste\n"
     "  dns <ad>                 - alan adini coz (A kaydi)\n"
     "  http <host> [yol] [dosya] - HTTP GET iste; govdeyi bulundugu dizine kaydet\n"
+    "  nettest                  - ag regresyon testi (ping/dns/http)\n"
     "  ping <a.b.c.d>           - ICMP echo gonder\n"
     "  reboot                   - yeniden baslat\n"
     "  poweroff                 - kapat\n"
@@ -474,6 +475,37 @@ static void run_line_inner(char* line, uint32_t& cwd, char* cwdstr, const char* 
                     kprintf("\n");
                 }
             }
+        }
+    }
+    else if (strcmp(cmd, "nettest") == 0) {
+        if (!net_active()) {
+            kprintf("nettest: FAIL (ag arayuzu yok)\n");
+        } else {
+            int step = 0;
+            bool ok = true;
+            uint32_t gw = net_get_gw();
+            kprintf("nettest: adim1 ping %u.%u.%u.%u ...\n",
+                    (gw >> 24) & 0xFF, (gw >> 16) & 0xFF, (gw >> 8) & 0xFF, gw & 0xFF);
+            if (!net_ping(gw)) { ok = false; step = 1; }
+
+            uint32_t dip = 0;
+            if (ok) {
+                kprintf("nettest: adim2 dns google.com ...\n");
+                if (!net_dns_resolve("google.com", &dip)) { ok = false; step = 2; }
+            }
+            uint32_t eip = 0;
+            if (ok) {
+                kprintf("nettest: adim3 dns example.com ...\n");
+                if (!net_dns_resolve("example.com", &eip)) { ok = false; step = 3; }
+            }
+            if (ok) {
+                static char hb[2048];
+                kprintf("nettest: adim4 http example.com/ ...\n");
+                if (!net_http_get(eip, 80, "example.com", "/", hb, sizeof(hb))) { ok = false; step = 4; }
+            }
+
+            if (ok) kprintf("nettest: PASS\n");
+            else    kprintf("nettest: FAIL (adim %d)\n", step);
         }
     }
     else if (strcmp(cmd, "ping") == 0) {
