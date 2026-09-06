@@ -60,6 +60,7 @@ const char* HELP =
     "  ifconfig                 - ag arayuz bilgisi\n"
     "  dhcp                     - DHCP ile IP iste\n"
     "  dns <ad>                 - alan adini coz (A kaydi)\n"
+    "  http <host> [yol] [dosya] - HTTP GET iste; govdeyi bulundugu dizine kaydet\n"
     "  ping <a.b.c.d>           - ICMP echo gonder\n"
     "  reboot                   - yeniden baslat\n"
     "  poweroff                 - kapat\n"
@@ -410,6 +411,69 @@ static void run_line_inner(char* line, uint32_t& cwd, char* cwdstr, const char* 
                         (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
             else
                 kprintf("cozulemedi: %s\n", t.tok[1]);
+        }
+    }
+    else if (strcmp(cmd, "http") == 0) {
+        if (t.n < 2) kprintf("kullanim: http <host> [yol] [dosya]\n");
+        else if (!net_active()) kprintf("hata: ag arayuzu yok\n");
+        else {
+            const char* host = t.tok[1];
+            const char* path = (t.n >= 3) ? t.tok[2] : "/";
+            const char* file = (t.n >= 4) ? t.tok[3] : NULL;
+            uint32_t ip = 0;
+            if (!net_dns_resolve(host, &ip)) {
+                kprintf("cozulemedi: %s\n", host);
+            } else {
+                static char buf[4096];
+                kprintf("GET http://%s%s ...\n", host, path);
+                if (!net_http_get(ip, 80, host, path, buf, sizeof(buf))) {
+                    kprintf("istek basarisiz (zaman asimi/red)\n");
+                } else {
+                    char* p = buf;
+                    while (*p && *p != '\r' && *p != '\n') p++;
+                    char sc = *p; *p = 0;
+                    kprintf("cevap status: %s\n", buf);
+                    *p = sc;
+                    char* body = buf;
+                    for (int i = 0; buf[i]; i++)
+                        if (i > 0 && buf[i - 3] == '\r' && buf[i - 2] == '\n' &&
+                            buf[i - 1] == '\r' && buf[i] == '\n') { body = buf + i + 1; break; }
+                    unsigned bl = 0; while (body[bl]) bl++;
+                    kprintf("govde: %u bayt\n", bl);
+                    char name[40];
+                    if (file) {
+                        strncpy(name, file, 39); name[39] = 0;
+                    } else {
+                        const char* seg = path;
+                        for (const char* q = path; *q; q++)
+                            if (*q == '/') seg = q + 1;   /* son '/ sonrasi parcasi */
+                        const char* dot = strrchr(seg, '.');
+                        if (!seg[0]) {                     /* yol bos: host.html */
+                            int h = 0; while (host[h] && h < 33) { name[h] = host[h]; h++; }
+                            memcpy(name + h, ".html", 6);
+                        } else if (dot && dot != seg) {
+                            int l = 0; while (seg[l] && l < 39) { name[l] = seg[l]; l++; }
+                            name[l] = 0;
+                        } else {
+                            int l = 0; while (seg[l] && l < 34) { name[l] = seg[l]; l++; }
+                            memcpy(name + l, ".html", 6);
+                        }
+                    }
+                    if (fs::write_file(cwd, name, body, bl))
+                        kprintf("kaydedildi: %s (%u bayt)\n", name, bl);
+                    else
+                        kprintf("hata: '%s' yazilamadi\n", name);
+                    p = body;
+                    while (*p) {
+                        if (*p != '\r') {
+                            if (*p == '\n') kprintf("  | ");
+                            else kprintf("%c", *p);
+                        }
+                        p++;
+                    }
+                    kprintf("\n");
+                }
+            }
         }
     }
     else if (strcmp(cmd, "ping") == 0) {

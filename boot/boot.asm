@@ -157,22 +157,46 @@ print:
     ret
 
 ; ----------------------------------------------------------------------------
-; load_kernel: kerneli LBA 1..KERNEL_SECTORS -> ara tampona parcali okur.
-;  Her Int13h cagrisi en fazla 127 sektordur (EDD tek-okuma siniri); boylece
-;  kernel boyutu 127*512 = 65024 bayt ile sinirli kalmaz.
-;  Ara tampon: STAGE_ADDR'den baslayarak ardisi dilimlere yazilir.
-;  Cagiran: uzak adresle son MB'ye kopyalar (KERNEL_SECTORS*512 bayt).
-; ----------------------------------------------------------------------------
-; ----------------------------------------------------------------------------
-; load_kernel: LBA 1..KERNEL_SECTORS -> STAGE_ADDR (tek Int13h okuma)
-;  (KERNEL_SECTORS <= 127 oldugu surece gecerlidir)
+; load_kernel: kerneli (LBA 1..KERNEL_SECTORS) STAGE_ADDR'ye parcali okur.
+;  Her Int13h cagrisi en fazla 127 sektor okuyabilir (EDD siniri); buyuk
+;  kerneller icin dilimler ardisik ara tampon yapilarina yazilir.
+;  Ara tampon: STAGE_ADDR (0x10000) ... 640KB siniri. (STAGE_ADDR 16 hizalı
+;  oldugundan ve dilim boyu 512'nin kati oldugundan tum dilimlerde offset=0.)
+;  Cikis: CF=0 basarili, CF=1 disk hatasi.
 ; ----------------------------------------------------------------------------
 load_kernel:
-    mov ah, 0x42
+    xor bp, bp                       ; toplam okunan sektor sayaci
     mov dl, [boot_drive]
-    mov si, dap
+.load_loop:
+    mov ax, KERNEL_SECTORS
+    sub ax, bp
+    jbe .load_done                   ; kalan 0 -> bitti
+    cmp ax, 127
+    jbe .chunk
+    mov ax, 127                      ; tek cagrida en fazla 127 sektor
+.chunk:
+    mov word [dap + 2], ax           ; dilim boyu
+    mov cx, bp
+    inc cx
+    mov word [dap + 8], cx           ; LBA = 1 + yuklenen
+    mov cx, bp
+    shl cx, 5
+    add cx, STAGE_ADDR >> 4          ; seg = (0x10000 + bp*512)/16
+    mov word [dap + 6], cx
+    mov ah, 0x42                     ; ax dilim boyu/hesabinda bozuldu
+    mov si, dap                      ; BIOS SI'yi bozabilir
+    push bp                          ; BIOS BP'yi bozabilir
     int 0x13
-    ret                     ; CF = BIOS hata bayragi
+    pop bp
+    jc .disk_fail
+    mov ax, word [dap + 2]
+    add bp, ax
+    jmp .load_loop
+.load_done:
+    ret
+.disk_fail:
+    stc
+    ret
 
 
 halt:

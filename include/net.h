@@ -10,6 +10,8 @@ void     net_handle_eth(const uint8_t* frame, uint16_t len);  /* rtl8139'dan gel
 bool     net_ping(uint32_t ip);                               /* ping gonder, sonuc don */
 bool     net_dhcp(void);                                      /* DHCP ile IP al (engelleyici) */
 bool     net_dns_resolve(const char* name, uint32_t* out_ip); /* A kaydi coz (engelleyici) */
+bool     net_http_get(uint32_t ip, uint16_t port, const char* host,
+                      const char* path, char* out, int out_cap);
 uint32_t net_get_dns(void);
 uint32_t net_get_ip(void);
 uint32_t net_get_mask(void);

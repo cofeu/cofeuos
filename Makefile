@@ -74,8 +74,8 @@ kernel.bin: kernel.elf
 	$(DPKG) $@.tmp
 	mv $@.tmp $@
 	@sz=$$(stat -c%s $@); \
-	if [ $$sz -gt $$((127 * 512)) ]; then \
-	    echo "HATA: kernel.bin $$sz bayt - boot tek sektor okumasi max 127*512 ile sinirli!" >&2; \
+	if [ $$sz -gt $$((400 * 512)) ]; then \
+	    echo "HATA: kernel.bin $$sz bayt - boot ara tamponu (640KB) sinirli!" >&2; \
 	    exit 1; \
 	fi
 

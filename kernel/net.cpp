@@ -154,7 +154,10 @@ void ip_send(uint32_t dst, const uint8_t* dmac, uint8_t proto,
 
     uint8_t tmpmac[6];
     if (!dmac) {
-        if (!arp_resolve(dst, tmpmac)) return;
+        uint32_t l2dst = dst;
+        if ((dst & our_mask) != (our_ip & our_mask))   /* dis ag: gateway uzerinden */
+            l2dst = gateway;
+        if (!arp_resolve(l2dst, tmpmac)) return;
         dmac = tmpmac;
     }
     eth_send(dmac, 0x0800, buf, tot);
@@ -395,6 +398,108 @@ void dns_cb(uint32_t src_ip, uint16_t src_port, const uint8_t* data, uint16_t le
     dns_done = true;                                /* yanit geldi, A kaydi yok */
 }
 
+/* ---- TCP (RFC 793) - tek got/gonder istemci, HTTP icin yeterli ---- */
+constexpr uint16_t TCP_FLAG_FIN  = 0x01;
+constexpr uint16_t TCP_FLAG_SYN  = 0x02;
+constexpr uint16_t TCP_FLAG_RST  = 0x04;
+constexpr uint16_t TCP_FLAG_PSH  = 0x08;
+constexpr uint16_t TCP_FLAG_ACK  = 0x10;
+
+volatile uint16_t tcp_sport = 0;
+volatile uint16_t tcp_rport = 0;
+uint32_t tcp_dst = 0;
+volatile uint32_t tcp_lseq = 0;    /* sonraki gonderilecek seq */
+volatile uint32_t tcp_rseq = 0;    /* peer'dan beklenen seq */
+volatile int  tcp_state = 0;       /* 0 kapali, 1 SYNSENT, 2 ESTABLISHED, 3 FIN */
+volatile bool tcp_waiting = false;
+volatile bool tcp_done = false;
+volatile bool tcp_ok = false;
+volatile uint32_t tcp_rx_len = 0;
+uint8_t* tcp_rx_buf = NULL;
+uint32_t tcp_rx_cap = 0;
+
+uint16_t tcp_checksum(uint32_t saddr, uint32_t daddr, const uint8_t* t, uint16_t tlen) {
+    uint32_t sum = 0;
+    sum += (saddr >> 16) + (saddr & 0xFFFF);
+    sum += (daddr >> 16) + (daddr & 0xFFFF);
+    sum += 6;                               /* protokol TCP */
+    sum += tlen;
+    int n = tlen;
+    while (n > 1) { sum += ((uint32_t)t[0] << 8) | t[1]; t += 2; n -= 2; }
+    if (n) sum += (uint32_t)t[0] << 8;
+    while (sum >> 16) sum = (sum & 0xFFFFu) + (sum >> 16);
+    return (uint16_t)~sum;
+}
+
+void tcp_send_seg(uint32_t seq, uint32_t ackno, uint16_t flags,
+                  const uint8_t* data, uint16_t len, bool advance) {
+    uint8_t t[20 + 1460];
+    memset(t, 0, 20);
+    wr16(t, tcp_sport);
+    wr16(t + 2, tcp_rport);
+    wr32(t + 4, seq);
+    wr32(t + 8, ackno);
+    t[12] = (5 << 4);
+    t[13] = (uint8_t)(flags & 0x3F);
+    wr16(t + 14, 0xFFFF);                   /* pencere */
+    wr16(t + 16, 0);                        /* checksum sonra */
+    if (len) memcpy(t + 20, data, len);
+    uint16_t tlen = (uint16_t)(len + 20);
+    wr16(t + 16, tcp_checksum(our_ip, tcp_dst, t, tlen));
+    ip_send(tcp_dst, NULL, 6, t, tlen);
+    if (advance) tcp_lseq = seq + len;
+}
+
+void tcp_ack_now(void) {
+    tcp_send_seg(tcp_lseq, tcp_rseq, TCP_FLAG_ACK, NULL, 0, false);
+}
+
+void handle_tcp(const uint8_t* ip, uint16_t iplen) {
+    uint32_t ihl = (uint32_t)(ip[0] & 0x0F) * 4u;
+    if (iplen < ihl + 20) return;
+    const uint8_t* t = ip + ihl;
+    if (!tcp_waiting || rd16(t + 2) != tcp_sport) return;
+
+    uint32_t seq  = rd32(t + 4);
+    uint32_t ack  = rd32(t + 8);
+    uint8_t  off  = (uint8_t)((t[12] & 0xF0) >> 2);     /* 4'luk kelime * 4 = byte */
+    if (off < 20 || (uint32_t)off > iplen - ihl) return;
+    uint16_t flags = (uint16_t)(t[13] & 0x3F);
+    uint16_t dlen = (uint16_t)(iplen - ihl - off);
+    const uint8_t* d = t + off;
+
+    if (flags & TCP_FLAG_RST) {
+        tcp_done = true; tcp_ok = false; tcp_state = 0;
+        return;
+    }
+
+    if (tcp_state == 1) {                    /* SYNSENT */
+        if ((flags & (TCP_FLAG_SYN | TCP_FLAG_ACK)) == (TCP_FLAG_SYN | TCP_FLAG_ACK) &&
+            ack == tcp_lseq + 1) {
+            tcp_rseq = seq + 1;              /* SYN birer seq tuketir */
+            tcp_state = 2;                   /* ESTABLISHED */
+            tcp_done = true; tcp_ok = true;
+        }
+        return;
+    }
+
+    if (tcp_state == 2 || tcp_state == 3) {
+        if (seq == tcp_rseq && dlen) {
+            uint32_t room = tcp_rx_cap - tcp_rx_len;
+            if (room > dlen) room = dlen;
+            memcpy(tcp_rx_buf + tcp_rx_len, d, room);
+            tcp_rx_len += room;
+            tcp_rseq = seq + dlen;
+        }
+        tcp_ack_now();
+        if (flags & TCP_FLAG_FIN) {
+            tcp_rseq += 1;                   /* FIN birer seq tuketir */
+            tcp_ack_now();
+            tcp_done = true; tcp_ok = true; tcp_state = 0;
+        }
+    }
+}
+
 } /* namespace */
 
 extern "C" void net_init(const uint8_t mac[6], uint32_t ip, uint32_t mask, uint32_t gw) {
@@ -424,10 +529,15 @@ extern "C" void net_handle_eth(const uint8_t* frame, uint16_t len) {
         uint32_t dst = rd32(ip + 16);
         uint32_t bc = our_ip | (~our_mask);
         if (!dhcp_waiting && dst != our_ip && dst != bc && dst != 0xFFFFFFFFu) return;
+        uint16_t iplen = rd16(ip + 2);           /* IP toplam uzunlugu (FCS/padding yok) */
+        uint16_t avail = (uint16_t)(len - 14);
+        if (iplen > avail) iplen = avail;         /* kaynaga guvenme */
         if (ip[9] == 1) {
-            handle_icmp(ip, (uint16_t)(len - 14), frame);
+            handle_icmp(ip, iplen, frame);
         } else if (ip[9] == 17) {
-            handle_udp(ip, (uint16_t)(len - 14));
+            handle_udp(ip, iplen);
+        } else if (ip[9] == 6) {
+            handle_tcp(ip, iplen);
         }
     }
 }
@@ -522,6 +632,78 @@ extern "C" bool net_dns_resolve(const char* name, uint32_t* out_ip) {
         }
     }
     return false;
+}
+
+extern "C" bool net_http_get(uint32_t ip, uint16_t port, const char* host,
+                             const char* path, char* out, int out_cap) {
+    if (!rtl8139_active()) return false;
+    if (!out || out_cap <= 0) return false;
+    if (!host || !*host) host = "10.0.2.2";
+    if (!path || !*path) path = "/";
+
+    tcp_dst = ip;
+    tcp_rport = port;
+    tcp_rx_buf = (uint8_t*)out;
+    tcp_rx_cap = (uint32_t)out_cap;
+
+    /* --- baglanti: SYN -> SYN+ACK --- */
+    tcp_sport = (uint16_t)(0xC000 | (timer_get_ticks() & 0xFF) | (timer_get_ticks() & 0x100));
+    tcp_lseq = (uint32_t)((timer_get_ticks() << 12) ^ 0x5A17FB22);
+    tcp_waiting = true; tcp_state = 1; tcp_done = false; tcp_ok = false;
+
+    bool connected = false;
+    for (int t = 0; t < 4 && !connected; t++) {
+        tcp_state = 1; tcp_done = false;
+        tcp_send_seg(tcp_lseq, 0, TCP_FLAG_SYN, NULL, 0, false);
+        uint64_t dd = timer_get_ticks() + 50;       /* 500ms */
+        while (!tcp_done && timer_get_ticks() < dd) cpu_hlt();
+        connected = tcp_done && tcp_ok;
+    }
+    if (!connected) { tcp_waiting = false; return false; }
+
+    /* --- istek: GET --- */
+    uint8_t req[512];
+    int rl = 0;
+    const char* hpre = host;
+    /* Host basligi */
+    memcpy(req + rl, "GET ", 4); rl += 4;
+    int pl = 0; while (path[pl]) pl++;
+    if (pl > 200) pl = 200;
+    memcpy(req + rl, path, (size_t)pl); rl += pl;
+    memcpy(req + rl, " HTTP/1.0\r\nHost: ", 17); rl += 17;
+    while (*hpre && rl < 500) req[rl++] = (uint8_t)*hpre++;
+    if (port != 80) {
+        req[rl++] = ':';
+        char pb[8]; int pn = 0;
+        uint32_t pv = port;
+        do { pb[pn++] = (char)('0' + (pv % 10)); pv /= 10; } while (pv && pn < 7);
+        while (pn) req[rl++] = (uint8_t)pb[--pn];
+    }
+    memcpy(req + rl, "\r\nUser-Agent: cofeuos-http/0.1\r\nConnection: close\r\n\r\n", 58); rl += 58;
+
+    uint32_t req_seq = tcp_lseq + 1;    /* SYN bir seq tuketti */
+    tcp_rx_len = 0; tcp_done = false;
+    tcp_send_seg(req_seq, tcp_rseq, TCP_FLAG_PSH | TCP_FLAG_ACK, req, (uint16_t)rl, true);
+
+    /* --- cevap bekle: veri/FIN ya da zaman asimi; sessizlikte tekrar gonder --- */
+    uint64_t wall = timer_get_ticks() + 400;        /* ~4 sn */
+    uint64_t last = timer_get_ticks();
+    int retrans = 0;
+    while (!tcp_done && timer_get_ticks() < wall) {
+        if (tcp_rx_len) last = timer_get_ticks();   /* veri akisi var */
+        else if (timer_get_ticks() - last > 100) {  /* 1 sn sessiz: tekrar gonder */
+            if (++retrans <= 3) {
+                tcp_send_seg(req_seq, tcp_rseq, TCP_FLAG_PSH | TCP_FLAG_ACK, req, (uint16_t)rl, false);
+                last = timer_get_ticks();
+            } else break;
+        }
+        cpu_hlt();
+    }
+    tcp_waiting = false;
+
+    bool got = tcp_ok && tcp_rx_len > 0;
+    tcp_rx_buf[tcp_rx_len > (uint32_t)out_cap - 1 ? (uint32_t)out_cap - 1 : tcp_rx_len] = 0;
+    return got;
 }
 
 extern "C" void net_ifconfig(void) {
