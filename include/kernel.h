@@ -92,6 +92,9 @@ bool ata_write_sector(uint32_t lba, const void* buf);
 uint32_t kmem_used(void);
 uint32_t kmem_capacity(void);
 
+/* ---- CMOS Real-Time Clock (RTC) ---- */
+void rtc_init(void);
+
 }
 
 /* ---- cofeufs dosya sistemi ---- */

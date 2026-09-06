@@ -1,12 +1,13 @@
 #include "kernel.h"
 #include "x86.h"
 #include "sched.h"
+#include "rtl8139.h"
 
 namespace {
 
 void mask_and_disable_all(void) {
-    outb(0xA1, 0xFF);   /* slave  : hepsi kapali */
-    outb(0x21, 0xFC);   /* master : sadece IRQ0 (timer) ve IRQ1 (keyboard) */
+    outb(0xA1, 0xF1);   /* slave  : IRQ9, IRQ10, IRQ11 acik (ag kartlari) */
+    outb(0x21, 0xFC);   /* master : IRQ0 (timer) ve IRQ1 (keyboard), kasit */
 }
 
 bool is_exception_fatal(uint64_t vec) {
@@ -95,11 +96,16 @@ extern "C" uint64_t isr_dispatch(uint64_t vec, uint64_t err, uint64_t ctx) {
         switch (vec) {
         case 0x20:
             timer_irq();
+            rtl8139_poll();          /* ag paketleri zamanlayiciyla da islenir */
             pic_send_eoi(0);
             return sched_tick(ctx);
         case 0x21:
             keyboard_irq();
             pic_send_eoi(1);
+            break;
+        case 0x29: case 0x2A: case 0x2B:   /* IRQ9/10/11: RTL8139 */
+            rtl8139_irq();
+            pic_send_eoi((uint8_t)(vec - 0x20));
             break;
         case 0x27: case 0x2F:   /* spurious */
             break;

@@ -19,6 +19,14 @@ static inline uint16_t inw(uint16_t port) {
     asm volatile("inw %1, %0" : "=a"(v) : "Nd"(port));
     return v;
 }
+static inline uint32_t inl(uint16_t port) {
+    uint32_t v;
+    asm volatile("inl %1, %0" : "=a"(v) : "Nd"(port));
+    return v;
+}
+static inline void outl(uint16_t port, uint32_t val) {
+    asm volatile("outl %0, %1" : : "a"(val), "Nd"(port));
+}
 static inline void io_wait(void) {
     asm volatile("outb %%al, $0x80" : : "a"((uint8_t)0));
 }

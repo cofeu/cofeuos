@@ -51,24 +51,17 @@ void _start(void) {
     if (pid == 1) child = fork_id();
 
     char tag = (pid == 1) ? (child ? 'P' : 'C') : 'U';
-    for (int it = 0; it < 3; it++) {
-        ul tt = sys3(5);
-        int n = 0;
-        buf[n++] = '[';
-        buf[n++] = tag;
-        buf[n++] = ']';
-        buf[n++] = ' ';
-        for (int k = 0; name[k] && k < 14; k++) buf[n++] = name[k];
-        buf[n++] = ' '; buf[n++] = 'p'; buf[n++] = 'i'; buf[n++] = 'd';
-        pr_hex(pid, buf + n); n += 18;
-        buf[n++] = ' '; buf[n++] = 'i'; buf[n++] = 't'; buf[n++] = '=';
-        n += pr_dec((ul)it, buf + n);
-        buf[n++] = ' '; buf[n++] = 't'; buf[n++] = '=';
-        n += pr_dec(tt, buf + n);
-        buf[n++] = '\n';
-        out(buf, (ul)n);
-        sleep_ms(120);
-    }
+
+    /* Basit PID ciktisi */
+    int n = 0;
+    buf[n++] = '[';
+    buf[n++] = tag;
+    buf[n++] = ']';
+    buf[n++] = ' ';
+    buf[n++] = 'P'; buf[n++] = 'I'; buf[n++] = 'D'; buf[n++] = ':';
+    n += pr_dec(pid, buf + n);
+    buf[n++] = '\n';
+    out(buf, (ul)n);
 
     if (pid == 4) {
         /* izolasyon testi: kernel bellegine yazmaya calis -> PF ile oldurulmali */

@@ -2,6 +2,8 @@
 #include "x86.h"
 #include "pmm.h"
 #include "sched.h"
+#include "rtc.h"
+#include "net.h"
 
 namespace {
 
@@ -46,6 +48,7 @@ const char* HELP =
     "  xxd <dosya>              - hexdump\n"
     "  rm [-r] <yol>            - dosya/dizin sil\n"
     "  lsfs                     - dosya sistemi bilgisi\n"
+    "  date                     - tarih ve saati goster\n"
     "  uptime                   - calisma suresi\n"
     "  cnv                      - sistem bilgisi (uname gibi)\n"
     "  mem                      - bellek kullanimi\n"
@@ -54,6 +57,8 @@ const char* HELP =
     "  wait [pid]               - zombie surec temizle / bekle\n"
     "  spawn <ad>               - yeni surec baslat\n"
     "  run <dosya.cexe>         - ELF uygulama calistir (diskten)\n"
+    "  ifconfig                 - ag arayuz bilgisi\n"
+    "  ping <a.b.c.d>           - ICMP echo gonder\n"
     "  reboot                   - yeniden baslat\n"
     "  poweroff                 - kapat\n"
     "\n"
@@ -315,6 +320,16 @@ static void run_line_inner(char* line, uint32_t& cwd, char* cwdstr, const char* 
     else if (strcmp(cmd, "lsfs") == 0)     cmd_lsfs();
     else if (strcmp(cmd, "pwd") == 0)      kprintf("%s\n", cwdstr);
     else if (strcmp(cmd, "uptime") == 0)   kprintf("calisma suresi: %llu sn\n", timer_get_seconds());
+    else if (strcmp(cmd, "date") == 0) {
+        RTCDate rtc = rtc_read();
+        const char* aylar[] = {"Ocak","Subat","Mart","Nisan","Mayis","Haziran",
+                               "Temmuz","Agustos","Eylul","Ekim","Kasim","Aralik"};
+        const char* gunler[] = {"Pazar","Pazartesi","Sali","Carsamba","Persembe","Cuma","Cumartesi"};
+        kprintf("%s, %02d %s %04d  %02d:%02d:%02d\n",
+                gunler[(rtc.day + 1) % 7],   /* basit gun hesabi */
+                rtc.day, aylar[rtc.month - 1], rtc.year,
+                rtc.hour, rtc.minute, rtc.second);
+    }
     else if (strcmp(cmd, "mem") == 0) {
         kprintf("RAM        : %lu MB (%lu KB)\n", pmm_total_kb() / 1024u, pmm_total_kb());
         kprintf("yonetilen  : %lu KB (%lu frame, %lu serbest)\n",
@@ -368,6 +383,26 @@ static void run_line_inner(char* line, uint32_t& cwd, char* cwdstr, const char* 
         int ec = sched_wait(want);
         if (ec < 0) kprintf("beklenecek surec yok\n");
         else kprintf("surec tamamlandi (cikis kodu: %d)\n", ec);
+    }
+    else if (strcmp(cmd, "ifconfig") == 0) {
+        if (!net_active()) kprintf("hata: ag arayuzu yok/aktif degil\n");
+        else net_ifconfig();
+    }
+    else if (strcmp(cmd, "ping") == 0) {
+        if (t.n < 2) kprintf("kullanim: ping <a.b.c.d>\n");
+        else {
+            bool ok = false;
+            uint32_t ip = net_parse_ip(t.tok[1], &ok);
+            if (!ok) { kprintf("hata: gecersiz IP\n"); }
+            else if (!net_active()) { kprintf("hata: ag arayuzu yok\n"); }
+            else {
+                kprintf("PING %s (64 bayt):\n", t.tok[1]);
+                if (net_ping(ip))
+                    kprintf("cevap! %s makinesinden\n", t.tok[1]);
+                else
+                    kprintf("zaman asimi (cevap yok)\n");
+            }
+        }
     }
     else if (strcmp(cmd, "reboot") == 0) {
         kprintf("yeniden baslatiliyor...\n");

@@ -19,13 +19,14 @@ LDFLAGS   = -m elf_x86_64 -T linker.ld -nostdlib -z max-page-size=0x1000
 OBJ = kernel/entry.o kernel/isr.o kernel/main.o kernel/util.o kernel/memory.o \
       kernel/pmm.o kernel/kprintf.o kernel/vga.o kernel/serial.o kernel/gdt.o \
       kernel/idt.o kernel/irq.o kernel/timer.o kernel/keyboard.o kernel/ata.o \
-      kernel/cofeufs.o kernel/shell.o kernel/sched.o kernel/user_embed.o 
+      kernel/cofeufs.o kernel/shell.o kernel/sched.o kernel/user_embed.o \
+      kernel/rtc.o kernel/pci.o kernel/rtl8139.o kernel/net.o
 
 DISK_SIZE_SECTORS = 67584
 
 DPKG = python3 -c "import sys;d=open(sys.argv[1],'rb').read();d=d.rstrip(b'\x00');open(sys.argv[1],'wb').write(d)"
 
-.PHONY: all run run-headless clean
+.PHONY: all run run-headless run-iso iso clean
 
 all: disk.img
 
@@ -40,8 +41,14 @@ boot/boot.bin: boot/boot.asm kernel.bin
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
-user/user_demo.elf: user/user.c
-	$(CC) $(USERFLAGS) -o $@ $<
+user/cofeu_note.o: user/cofeu_note.asm
+	$(NASM) -f elf64 -o $@ $<
+
+user/user_demo.o: user/user.c
+	$(CC) $(USERFLAGS) -c -o $@ $<
+
+user/user_demo.elf: user/user_demo.o user/cofeu_note.o
+	$(CC) $(USERFLAGS) -o $@ $< user/cofeu_note.o
 
 user/user_demo.bin: user/user_demo.elf
 	$(OBJCOPY) -O binary --remove-section=.note.gnu.property $< $@
@@ -50,8 +57,11 @@ user/user_demo.bin: user/user_demo.elf
 kernel/user_embed.o: user/user_demo.bin
 	$(LD) -r -b binary $< -o $@
 
-user/user2.elf: user2/user2.c
-	$(CC) $(USERFLAGS) -o $@ $<
+user/user2.o: user2/user2.c
+	$(CC) $(USERFLAGS) -c -o $@ $<
+
+user/user2.elf: user/user2.o user/cofeu_note.o
+	$(CC) $(USERFLAGS) -o $@ $< user/cofeu_note.o
 
 kernel/sched.o: kernel/sched.cpp user/user_demo.elf
 	$(CXX) $(CXXFLAGS) -DUSER_ENTRY_ADDR=$$(readelf -h user/user_demo.elf | grep 'Entry point' | sed -n 's/.*\(0x[0-9a-fA-F]*\).*/\1/p') -c -o $@ $<
@@ -77,14 +87,32 @@ disk.img: boot/boot.bin kernel.bin user/user_demo.elf user/user2.elf tools/mkfs.
 	    user/user_demo.elf:/sys/basic.cexe \
 	    user/user2.elf:/sys/hello.cexe
 
+QEMU_NET = -netdev user,id=n0 -device rtl8139,netdev=n0
+
 run: disk.img
 	$(QEMU) -drive file=disk.img,format=raw,cache=writethrough,index=0 \
-	        -m 128 -boot c -serial stdio -monitor none -no-reboot
+	        -m 128 -boot c -serial stdio -monitor none -no-reboot $(QEMU_NET)
 
 run-headless: disk.img
 	$(QEMU) -drive file=disk.img,format=raw,cache=writethrough,index=0 \
-	        -m 128 -boot c -nographic -serial mon:stdio -monitor none -no-reboot
+	        -m 128 -boot c -nographic -serial mon:stdio -monitor none -no-reboot $(QEMU_NET)
+
+iso: disk.img
+	@mkdir -p iso_root
+	@cp disk.img iso_root/cofeuos.img
+	xorriso -as mkisofs \
+	    -o cofeuos.iso \
+	    -J -joliet-long \
+	    iso_root
+	@rm -rf iso_root
+	@echo "cofeuos.iso olusturuldu ($$(stat -c%s cofeuos.iso) bayt)"
+
+run-iso: iso disk.img
+	$(QEMU) -drive file=disk.img,format=raw,cache=writethrough,index=0 \
+	        -drive file=cofeuos.iso,format=raw,if=ide,media=cdrom,index=2 \
+	        -m 128 -boot c -serial stdio -monitor none -no-reboot
 
 clean:
-	rm -f kernel.elf kernel.bin disk.img boot/boot.bin
-	rm -f kernel/*.o user/user_demo.elf user/user_demo.bin user/user2.elf
+	rm -f kernel.elf kernel.bin disk.img boot/boot.bin cofeuos.iso
+	rm -f kernel/*.o user/user_demo.o user/user_demo.elf user/user_demo.bin user/user2.o user/user2.elf user/cofeu_note.o
+	rm -rf iso_root

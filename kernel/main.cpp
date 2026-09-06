@@ -2,6 +2,10 @@
 #include "x86.h"
 #include "pmm.h"
 #include "sched.h"
+#include "rtc.h"
+#include "pci.h"
+#include "rtl8139.h"
+#include "net.h"
 
 /* Uygulamalar (/sys/*.cexe) derleme aninda tools/mkfs.py ile disk.img'ye
    yazilir; kernel.bin'de ELF gommek boot 127-sektor limitini asardi. */
@@ -18,6 +22,7 @@ extern "C" void kernel_main(void) {
     idt_init();
     pic_remap();
     timer_init();
+    rtc_init();
 
     pmm_init();
     kmalloc_init();
@@ -43,6 +48,21 @@ extern "C" void kernel_main(void) {
         if (mnt) {
             fs::selftest();
         }
+    }
+
+    pci_scan();
+    int nic = pci_find(0x10EC, 0x8139);
+    if (nic >= 0) {
+        const PCIDevice* d = pci_get(nic);
+        uint16_t io_base = (uint16_t)((d->bar0 & 0xFFFCu));
+        if (rtl8139_init(io_base, d->irq, d->bus, d->slot, d->func)) {
+            uint8_t mac[6];
+            rtl8139_get_mac(mac);
+            net_init(mac, 0x0A00020F, 0xFFFFFF00, 0x0A000202);
+            kprintf("net : eth0 10.0.2.15/24 (kapidan 10.0.2.2)\n");
+        }
+    } else {
+        kprintf("net : RTL8139 bulunamadi\n");
     }
 
     keyboard_init();
