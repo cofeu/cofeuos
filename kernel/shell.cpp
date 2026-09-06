@@ -59,6 +59,7 @@ const char* HELP =
     "  run <dosya.cexe>         - ELF uygulama calistir (diskten)\n"
     "  ifconfig                 - ag arayuz bilgisi\n"
     "  dhcp                     - DHCP ile IP iste\n"
+    "  dns <ad>                 - alan adini coz (A kaydi)\n"
     "  ping <a.b.c.d>           - ICMP echo gonder\n"
     "  reboot                   - yeniden baslat\n"
     "  poweroff                 - kapat\n"
@@ -396,6 +397,19 @@ static void run_line_inner(char* line, uint32_t& cwd, char* cwdstr, const char* 
             net_ifconfig();
         } else {
             kprintf("dhcp: zaman asimi (cevap yok)\n");
+        }
+    }
+    else if (strcmp(cmd, "dns") == 0) {
+        if (t.n < 2) kprintf("kullanim: dns <alan adi>\n");
+        else if (!net_active()) kprintf("hata: ag arayuzu yok\n");
+        else {
+            uint32_t ip = 0;
+            kprintf("cozuluyor: %s ...\n", t.tok[1]);
+            if (net_dns_resolve(t.tok[1], &ip))
+                kprintf("%s -> %u.%u.%u.%u\n", t.tok[1],
+                        (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
+            else
+                kprintf("cozulemedi: %s\n", t.tok[1]);
         }
     }
     else if (strcmp(cmd, "ping") == 0) {

@@ -276,14 +276,123 @@ void handle_dhcp(const uint8_t* b, uint16_t avail) {
     }
 }
 
+/* ---- UDP soket kayitlari (kucuk dagitici) ---- */
+typedef void (*udp_cb_t)(uint32_t src_ip, uint16_t src_port, const uint8_t* data, uint16_t len);
+struct UdpSock { bool used; uint16_t dport; udp_cb_t cb; };
+UdpSock udp_socks[8];
+
+int udp_sock_add(uint16_t dport, udp_cb_t cb) {
+    for (int i = 0; i < 8; i++)
+        if (!udp_socks[i].used) {
+            udp_socks[i].used = true;
+            udp_socks[i].dport = dport;
+            udp_socks[i].cb = cb;
+            return i;
+        }
+    return -1;
+}
+
+void udp_sock_remove(int idx) {
+    if (idx >= 0 && idx < 8) udp_socks[idx].used = false;
+}
+
 void handle_udp(const uint8_t* ip, uint16_t len) {
     uint32_t ihl = (uint32_t)(ip[0] & 0x0F) * 4u;
     if (len < ihl + 8) return;
     const uint8_t* u = ip + ihl;
+    uint16_t sport = rd16(u);
+    uint16_t dport = rd16(u + 2);
     uint16_t ulen = rd16(u + 4);
     if (ulen < 8 || ulen > len - ihl) ulen = (uint16_t)(len - ihl);
-    if (rd16(u + 2) == 68 && dhcp_waiting && ulen >= 244)  /* bootpc: DHCP */
+
+    if (dport == 68 && dhcp_waiting && ulen >= 244) {      /* bootpc: DHCP */
         handle_dhcp(u + 8, (uint16_t)(ulen - 8));
+        return;
+    }
+    for (int i = 0; i < 8; i++)
+        if (udp_socks[i].used && udp_socks[i].dport == dport) {
+            udp_socks[i].cb(rd32(ip + 12), sport, u + 8, (uint16_t)(ulen - 8));
+            return;
+        }
+}
+
+/* ---- DNS (RFC 1035) ---- */
+constexpr uint16_t DNS_SPORT = 5300;    /* gecici kaynak portu */
+volatile bool     dns_waiting = false;
+volatile bool     dns_done = false;
+volatile uint16_t dns_id = 0;
+bool     dns_ok = false;
+uint32_t dns_result = 0;
+
+int dns_qname(uint8_t* out, const char* name) {
+    int n = 0;
+    while (*name && n < 250) {
+        const char* p = name;
+        while (*p && *p != '.') p++;
+        int l = (int)(p - name);
+        if (l > 0 && l <= 63) {
+            out[n++] = (uint8_t)l;
+            memcpy(out + n, name, (size_t)l);
+            n += l;
+        }
+        name = (*p == '.') ? p + 1 : p;
+    }
+    out[n++] = 0;
+    return n;
+}
+
+void dns_skip_name(const uint8_t* d, int& pos, int limit) {
+    for (;;) {
+        if (pos < 0 || pos >= limit) { pos = -1; return; }
+        uint8_t b = d[pos];
+        if (b & 0xC0) { pos += 2; return; }        /* sikistirma isaretcisi */
+        if (b == 0)   { pos += 1; return; }
+        pos += 1 + b;
+    }
+}
+
+int dns_query(uint8_t* b, uint16_t qid, const char* name) {
+    wr16(b, qid);
+    wr16(b + 2, 0x0100);                            /* RD istendi */
+    wr16(b + 4, 1);                                 /* 1 soru */
+    wr16(b + 6, 0); wr16(b + 8, 0); wr16(b + 10, 0);
+    int n = dns_qname(b + 12, name);
+    wr16(b + 12 + n, 1);                            /* A */
+    wr16(b + 14 + n, 1);                            /* IN */
+    return 12 + n + 4;
+}
+
+void dns_cb(uint32_t src_ip, uint16_t src_port, const uint8_t* data, uint16_t len) {
+    (void)src_ip; (void)src_port;
+    if (!dns_waiting || len < 12) return;
+    if (rd16(data) != dns_id) return;               /* eslesen sorgu id */
+    uint16_t flags = rd16(data + 2);
+    if (!(flags & 0x8000)) return;                  /* yanit degil */
+    uint16_t qd = rd16(data + 4);
+    uint16_t an = rd16(data + 6);
+    int pos = 12;
+    int limit = (int)len;
+    for (int i = 0; i < qd; i++) {
+        dns_skip_name(data, pos, limit);
+        if (pos < 0) return;
+        pos += 4;
+    }
+    for (int i = 0; i < an; i++) {
+        dns_skip_name(data, pos, limit);
+        if (pos < 0) return;
+        if (pos + 10 > limit) return;
+        uint16_t type   = rd16(data + pos);
+        uint16_t rdlen  = rd16(data + pos + 8);
+        pos += 10;
+        if (type == 1 && rdlen == 4 && pos + 4 <= limit) {  /* A kaydi */
+            dns_result = rd32(data + pos);
+            dns_ok = true;
+            dns_done = true;
+            return;
+        }
+        pos += rdlen;
+    }
+    dns_done = true;                                /* yanit geldi, A kaydi yok */
 }
 
 } /* namespace */
@@ -384,6 +493,35 @@ extern "C" bool net_dhcp(void) {
     dns_server = dhcp_offer_dns;
     for (int i = 0; i < 8; i++) arp_cache[i].valid = false;
     return true;
+}
+
+extern "C" bool net_dns_resolve(const char* name, uint32_t* out_ip) {
+    if (!rtl8139_active()) return false;
+    if (!name || !*name) return false;
+    uint32_t server = dns_server ? dns_server : 0x0A000203u;
+
+    for (int attempt = 0; attempt < 3; attempt++) {
+        dns_id = (uint16_t)((timer_get_ticks() + (uint64_t)attempt) * 0x9E37u) | 0x8000u;
+        uint8_t q[280];
+        int qlen = dns_query(q, dns_id, name);
+        if (qlen < 32) { memset(q + qlen, 0, 32 - qlen); qlen = 32; }
+
+        int sock = udp_sock_add(DNS_SPORT, dns_cb);
+        if (sock < 0) return false;
+        dns_waiting = true; dns_done = false; dns_ok = false;
+        udp_send(server, 53, DNS_SPORT, q, (uint16_t)qlen);
+
+        uint64_t t = timer_get_ticks() + 100;        /* 1 sn bekleyis */
+        while (!dns_done && timer_get_ticks() < t) cpu_hlt();
+        dns_waiting = false;
+        udp_sock_remove(sock);
+
+        if (dns_done) {
+            if (out_ip && dns_ok) *out_ip = dns_result;
+            return dns_ok;
+        }
+    }
+    return false;
 }
 
 extern "C" void net_ifconfig(void) {
