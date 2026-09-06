@@ -58,6 +58,7 @@ const char* HELP =
     "  spawn <ad>               - yeni surec baslat\n"
     "  run <dosya.cexe>         - ELF uygulama calistir (diskten)\n"
     "  ifconfig                 - ag arayuz bilgisi\n"
+    "  dhcp                     - DHCP ile IP iste\n"
     "  ping <a.b.c.d>           - ICMP echo gonder\n"
     "  reboot                   - yeniden baslat\n"
     "  poweroff                 - kapat\n"
@@ -387,6 +388,15 @@ static void run_line_inner(char* line, uint32_t& cwd, char* cwdstr, const char* 
     else if (strcmp(cmd, "ifconfig") == 0) {
         if (!net_active()) kprintf("hata: ag arayuzu yok/aktif degil\n");
         else net_ifconfig();
+    }
+    else if (strcmp(cmd, "dhcp") == 0) {
+        if (!net_active()) kprintf("hata: ag arayuzu yok/aktif degil\n");
+        else if (net_dhcp()) {
+            kprintf("dhcp: tamam\n");
+            net_ifconfig();
+        } else {
+            kprintf("dhcp: zaman asimi (cevap yok)\n");
+        }
     }
     else if (strcmp(cmd, "ping") == 0) {
         if (t.n < 2) kprintf("kullanim: ping <a.b.c.d>\n");

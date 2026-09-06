@@ -58,8 +58,16 @@ extern "C" void kernel_main(void) {
         if (rtl8139_init(io_base, d->irq, d->bus, d->slot, d->func)) {
             uint8_t mac[6];
             rtl8139_get_mac(mac);
-            net_init(mac, 0x0A00020F, 0xFFFFFF00, 0x0A000202);
-            kprintf("net : eth0 10.0.2.15/24 (kapidan 10.0.2.2)\n");
+            net_init(mac, 0, 0, 0);                  /* anahtar: MAC; IP DHCP'den */
+            if (net_dhcp()) {
+                uint32_t ip = net_get_ip(), gw = net_get_gw();
+                kprintf("net : eth0 DHCP tamam (%u.%u.%u.%u, kapidan %u.%u.%u.%u)\n",
+                        (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF,
+                        (gw >> 24) & 0xFF, (gw >> 16) & 0xFF, (gw >> 8) & 0xFF, gw & 0xFF);
+            } else {
+                net_init(mac, 0x0A00020F, 0xFFFFFF00, 0x0A000202);
+                kprintf("net : eth0 DHCP zaman asimi, sabit 10.0.2.15/24 (kapidan 10.0.2.2)\n");
+            }
         }
     } else {
         kprintf("net : RTL8139 bulunamadi\n");

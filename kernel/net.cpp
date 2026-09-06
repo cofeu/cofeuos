@@ -184,6 +184,108 @@ void handle_icmp(const uint8_t* ip, uint16_t len, const uint8_t* eth_src) {
     }
 }
 
+/* ---- UDP ---- */
+uint16_t udp_checksum(uint32_t saddr, uint32_t daddr, const uint8_t* u, uint16_t ulen) {
+    uint32_t sum = 0;
+    sum += (saddr >> 16) + (saddr & 0xFFFF);
+    sum += (daddr >> 16) + (daddr & 0xFFFF);
+    sum += 17;                              /* protokol */
+    sum += ulen;
+    int n = ulen;
+    while (n > 1) { sum += ((uint32_t)u[0] << 8) | u[1]; u += 2; n -= 2; }
+    if (n) sum += (uint32_t)u[0] << 8;
+    while (sum >> 16) sum = (sum & 0xFFFFu) + (sum >> 16);
+    return (uint16_t)~sum;
+}
+
+void udp_send(uint32_t dst, uint16_t dport, uint16_t sport, const uint8_t* data, uint16_t len) {
+    uint8_t u[8 + 1500];
+    wr16(u, sport);
+    wr16(u + 2, dport);
+    wr16(u + 4, (uint16_t)(len + 8));
+    wr16(u + 6, 0);
+    if (len) memcpy(u + 8, data, len);
+    wr16(u + 6, udp_checksum(our_ip, dst, u, (uint16_t)(len + 8)));
+    ip_send(dst, NULL, 17, u, (uint16_t)(len + 8));
+}
+
+/* ---- DHCP ---- */
+volatile bool     dhcp_waiting = false;
+volatile bool     dhcp_done = false;
+volatile uint32_t dhcp_txid = 0;
+volatile int      dhcp_phase = 0;      /* 1=OFFER bekle, 3=ACK bekle */
+uint32_t dhcp_offer_ip = 0;
+uint32_t dhcp_offer_mask = 0;
+uint32_t dhcp_offer_router = 0;
+uint32_t dhcp_offer_dns = 0;
+uint32_t dhcp_offer_sid = 0;
+uint32_t dns_server = 0;
+
+uint8_t* dhcp_build(uint8_t* b, uint8_t mtype) {
+    memset(b, 0, 240);
+    b[0] = 1; b[1] = 1; b[2] = 6;       /* request, ethernet, mac 6 */
+    wr32(b + 4, dhcp_txid);
+    wr16(b + 10, 0x8000);               /* yaniti broadcast iste */
+    memcpy(b + 28, our_mac, 6);
+    b[236] = 0x63; b[237] = 0x82; b[238] = 0x53; b[239] = 0x63;  /* sihirli cookie */
+    uint8_t* o = b + 240;
+    *o++ = 53; *o++ = 1; *o++ = mtype;
+    if (mtype == 3) {                   /* REQUEST: istenen IP + sunucu */
+        *o++ = 50; *o++ = 4; wr32(o, dhcp_offer_ip); o += 4;
+        *o++ = 54; *o++ = 4; wr32(o, dhcp_offer_sid); o += 4;
+    }
+    *o++ = 255;
+    return o;
+}
+
+void handle_dhcp(const uint8_t* b, uint16_t avail) {
+    if (b[0] != 2 || b[1] != 1 || b[2] != 6) return;
+    if (rd32(b + 4) != dhcp_txid) return;
+    if (rd32(b + 236) != 0x63825363u) return;
+
+    uint8_t mtype = 0;
+    uint32_t mask = 0, router = 0, dns = 0, sid = 0;
+    if (avail > 300) avail = 300;
+    const uint8_t* o = b + 240;
+    const uint8_t* end = b + 240 + avail;
+    while (o + 2 <= end) {
+        if (*o == 255) break;
+        if (*o == 0) { o++; continue; }
+        uint8_t c = *o++;
+        uint8_t ln = *o++;
+        if (o + ln > end) break;
+        if (c == 53 && ln == 1)       { mtype  = o[0]; }
+        else if (c == 1 && ln == 4)   { mask   = rd32(o); }
+        else if (c == 3 && ln >= 4)   { router = rd32(o); }
+        else if (c == 6 && ln >= 4)   { dns    = rd32(o); }
+        else if (c == 54 && ln == 4)  { sid    = rd32(o); }
+        o += ln;
+    }
+
+    if (dhcp_phase == 1 && mtype == 2) {              /* OFFER */
+        dhcp_offer_ip = rd32(b + 16);
+        dhcp_offer_mask = mask; dhcp_offer_router = router;
+        dhcp_offer_dns = dns; dhcp_offer_sid = sid;
+        dhcp_done = true;
+    } else if (dhcp_phase == 3 && mtype == 5) {       /* ACK */
+        dhcp_offer_ip = rd32(b + 16);
+        if (mask)   dhcp_offer_mask   = mask;
+        if (router) dhcp_offer_router = router;
+        if (dns)    dhcp_offer_dns    = dns;
+        dhcp_done = true;
+    }
+}
+
+void handle_udp(const uint8_t* ip, uint16_t len) {
+    uint32_t ihl = (uint32_t)(ip[0] & 0x0F) * 4u;
+    if (len < ihl + 8) return;
+    const uint8_t* u = ip + ihl;
+    uint16_t ulen = rd16(u + 4);
+    if (ulen < 8 || ulen > len - ihl) ulen = (uint16_t)(len - ihl);
+    if (rd16(u + 2) == 68 && dhcp_waiting && ulen >= 244)  /* bootpc: DHCP */
+        handle_dhcp(u + 8, (uint16_t)(ulen - 8));
+}
+
 } /* namespace */
 
 extern "C" void net_init(const uint8_t mac[6], uint32_t ip, uint32_t mask, uint32_t gw) {
@@ -212,8 +314,12 @@ extern "C" void net_handle_eth(const uint8_t* frame, uint16_t len) {
         const uint8_t* ip = frame + 14;
         uint32_t dst = rd32(ip + 16);
         uint32_t bc = our_ip | (~our_mask);
-        if (dst != our_ip && dst != bc && dst != 0xFFFFFFFFu) return;
-        if (ip[9] == 1) handle_icmp(ip, (uint16_t)(len - 14), frame);
+        if (!dhcp_waiting && dst != our_ip && dst != bc && dst != 0xFFFFFFFFu) return;
+        if (ip[9] == 1) {
+            handle_icmp(ip, (uint16_t)(len - 14), frame);
+        } else if (ip[9] == 17) {
+            handle_udp(ip, (uint16_t)(len - 14));
+        }
     }
 }
 
@@ -241,6 +347,45 @@ extern "C" bool net_ping(uint32_t ip) {
     return true;
 }
 
+extern "C" bool net_dhcp(void) {
+    dhcp_txid = (uint32_t)(timer_get_ticks() * 2654435761u) ^ 0xE17A11;
+    uint64_t wall = timer_get_ticks() + 300;         /* ~3 sn toplam sure */
+    bool got_offer = false;
+
+    while (timer_get_ticks() < wall && !got_offer) {
+        dhcp_waiting = true;
+        dhcp_phase = 1;
+        dhcp_done = false;
+        uint8_t b[272];
+        uint8_t* e = dhcp_build(b, 1);               /* DISCOVER */
+        udp_send(0xFFFFFFFFu, 67, 68, b, (uint16_t)(e - b));
+        uint64_t t = timer_get_ticks() + 30;         /* 300ms OFFER bekle */
+        while (!dhcp_done && timer_get_ticks() < t) cpu_hlt();
+        got_offer = dhcp_done;
+    }
+    if (!got_offer) { dhcp_waiting = false; return false; }
+
+    wall = timer_get_ticks() + 100;                  /* ~1 sn ACK bekle */
+    while (timer_get_ticks() < wall && !dhcp_done) {
+        dhcp_phase = 3;
+        dhcp_done = false;
+        uint8_t b[272];
+        uint8_t* e = dhcp_build(b, 3);               /* REQUEST */
+        udp_send(0xFFFFFFFFu, 67, 68, b, (uint16_t)(e - b));
+        uint64_t t = timer_get_ticks() + 30;
+        while (!dhcp_done && timer_get_ticks() < t) cpu_hlt();
+    }
+    dhcp_waiting = false;
+    if (!dhcp_done) return false;
+
+    our_ip    = dhcp_offer_ip;
+    our_mask  = dhcp_offer_mask ? dhcp_offer_mask : 0xFFFFFF00u;
+    gateway   = dhcp_offer_router;
+    dns_server = dhcp_offer_dns;
+    for (int i = 0; i < 8; i++) arp_cache[i].valid = false;
+    return true;
+}
+
 extern "C" void net_ifconfig(void) {
     kprintf("eth0     IP : %u.%u.%u.%u\n",
             (our_ip >> 24) & 0xFF, (our_ip >> 16) & 0xFF,
@@ -254,12 +399,20 @@ extern "C" void net_ifconfig(void) {
     kprintf("eth0  Yol  : %u.%u.%u.%u\n",
             (gateway >> 24) & 0xFF, (gateway >> 16) & 0xFF,
             (gateway >> 8) & 0xFF, gateway & 0xFF);
+    kprintf("eth0  DNS  : %u.%u.%u.%u\n",
+            (dns_server >> 24) & 0xFF, (dns_server >> 16) & 0xFF,
+            (dns_server >> 8) & 0xFF, dns_server & 0xFF);
     kprintf("eth0  MAC  : %02x:%02x:%02x:%02x:%02x:%02x\n",
             our_mac[0], our_mac[1], our_mac[2], our_mac[3], our_mac[4], our_mac[5]);
     kprintf("istatistik  : rx=%llu tx=%llu rx-bayt=%llu\n",
             (unsigned long long)stat_rx, (unsigned long long)stat_tx,
             (unsigned long long)stat_rx_bytes);
 }
+
+extern "C" uint32_t net_get_dns(void) { return dns_server; }
+extern "C" uint32_t net_get_ip(void) { return our_ip; }
+extern "C" uint32_t net_get_mask(void) { return our_mask; }
+extern "C" uint32_t net_get_gw(void) { return gateway; }
 
 extern "C" bool net_active(void) { return rtl8139_active(); }
 
