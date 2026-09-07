@@ -433,8 +433,12 @@ constexpr int    TCP_MSS     = 1460;        /* MTU1500 - IP20 - TCP20 */
 constexpr int    TCP_RX_RING = 8192;        /* soket basina gelen veri tamponu */
 constexpr int    TCP_OOO_MAX = 4;           /* soket basina siralamasi bekleyen segment kapi */
 constexpr int    TCP_SOCKS   = 8;           /* eszamanli soket sayisi */
+constexpr int    TCP_TXQ     = 8;           /* soket basina onaysiz (in-flight) segment kapi */
 constexpr uint32_t TCP_RTO0  = 500;         /* ilk RTO (ms) */
+constexpr uint32_t TCP_RTO_MIN = 200;
 constexpr uint32_t TCP_RTO_MAX = 3000;
+constexpr uint32_t TCP_CWND_INIT = 4 * (uint32_t)TCP_MSS;     /* slow-start baslangic penceresi */
+constexpr uint32_t TCP_SSTHRESH_INIT = 64 * (uint32_t)TCP_MSS;
 
 struct OooSlice {
     bool     used;
@@ -444,10 +448,11 @@ struct OooSlice {
 };
 
 struct TxSlot {
-    bool     pending;        /* retransmisyon bekleyen tek veri segmenti */
-    uint32_t seq;
-    uint16_t len;
-    uint8_t  data[TCP_MSS];
+    volatile bool      pend;      /* gonderildi, onay bekliyor */
+    uint32_t           seq;
+    uint16_t           len;
+    volatile uint64_t  sent_at;   /* gonderim anindaki tick (10ms) */
+    uint8_t            data[TCP_MSS];
 };
 
 struct Tcb {
@@ -464,9 +469,12 @@ struct Tcb {
     volatile uint16_t snd_wnd;   /* peer'in penceresi */
     volatile uint8_t  st_v;      /* ISR'den gorunen durum (st ile esit) */
     uint16_t  mss;
-    uint32_t  rto;           /* ms */
-    uint64_t  rtx_at;
+    uint32_t  rto;           /* ms (Jacobson) */
+    uint32_t  srtt, rttvar;  /* yumusatilmis RTT ve sapma (ms) */
+    uint32_t  cwnd, ssthresh;/* kongesyon kontrolu (bayt) */
     uint32_t  dupacks;
+    uint8_t   tx_head, tx_tail;  /* onaysiz segment halkasi */
+    TxSlot    txb[TCP_TXQ];
     bool fin_tx, fin_rx;
     uint32_t  fin_seq;       /* FIN'imizin seq'i */
     uint64_t  tw_at;         /* TIME_WAIT sayaci */
@@ -480,7 +488,6 @@ struct Tcb {
     volatile uint32_t rxr_w, rxr_fill;
     uint8_t  rxr[TCP_RX_RING];      /* ISR yazar / uygulama okur */
     OooSlice ooo[TCP_OOO_MAX];
-    TxSlot   txq;
 };
 
 static Tcb conns[TCP_SOCKS];
@@ -533,6 +540,13 @@ static void ack_delayed(Tcb& t) {
 }
 
 /* retransmisyon zamanlayicisi: her spin dongusunde cagir. */
+static void rto_backoff(Tcb& t) {           /* zaman asimi: geri cekilme + pencereleri kir */
+    uint32_t mss = t.mss ? t.mss : (uint32_t)TCP_MSS;
+    uint32_t h = t.cwnd / 2;
+    t.ssthresh = h > 2u * mss ? h : 2u * mss;
+    t.cwnd = mss;                            /* RTO sonrasi dogrudan 1 MSS */
+}
+
 void tcp_poll(Tcb& t) {
     if (!t.used || t.st == 0 || t.st == 1) return;
     if (t.ack_want && t.rcv_nxt != t.last_ack && timer_get_ticks() >= t.ack_at) tcp_ack_now(t);
@@ -540,12 +554,65 @@ void tcp_poll(Tcb& t) {
         if (timer_get_ticks() >= t.tw_at) { t.used = 0; t.st = 0; t.ok = true; t.done = true; }
         return;
     }
-    if (t.txq.pending && t.snd_una == t.txq.seq &&
-        timer_get_ticks() >= t.rtx_at) {
-        tcp_emit(t, t.txq.seq, TCP_FLAG_ACK | TCP_FLAG_PSH, t.txq.data, t.txq.len, false);
-        t.rtx_at = timer_get_ticks() + (t.rto + 49) / 50;
-        t.rto = (t.rto * 2 > TCP_RTO_MAX) ? TCP_RTO_MAX : t.rto * 2;
+    /* en eski onaysiz segmentin RTO'sunu kontrol et */
+    TxSlot& sl = t.txb[t.tx_tail];
+    if (sl.pend && t.snd_una == sl.seq &&
+        timer_get_ticks() - sl.sent_at >= (uint64_t)((t.rto + 49) / 50)) {
+        tcp_emit(t, sl.seq, TCP_FLAG_ACK | TCP_FLAG_PSH, sl.data, sl.len, false);
+        sl.sent_at = timer_get_ticks();
+        if (t.rto < TCP_RTO_MAX) t.rto *= 2;
+        if (t.rto > TCP_RTO_MAX) t.rto = TCP_RTO_MAX;
+        rto_backoff(t);
     }
+}
+
+/* RTT orneklemesi: en eski onaysiz slotun gonderim ani ile bu anin uzakligi.
+   RFC 6298: her segmente degil, RTT boyunca tek ornek. */
+static void rtt_update(Tcb& t) {
+    TxSlot& sl = t.txb[t.tx_tail];
+    if (!sl.pend) return;
+    uint32_t rtt_ms = (uint32_t)((timer_get_ticks() - sl.sent_at) * 10u);
+    if (rtt_ms == 0) rtt_ms = 1;
+    if (!t.srtt) { t.srtt = rtt_ms; t.rttvar = rtt_ms / 2; }
+    else {
+        uint32_t dv = t.srtt > rtt_ms ? t.srtt - rtt_ms : rtt_ms - t.srtt;
+        t.rttvar = (3u * t.rttvar + dv) / 4u;
+        t.srtt   = (7u * t.srtt + rtt_ms) / 8u;
+    }
+    uint32_t v4 = t.rttvar * 4u; if (v4 < 50) v4 = 50;
+    uint32_t rt = t.srtt + v4;
+    if (rt < TCP_RTO_MIN) rt = TCP_RTO_MIN;
+    if (rt > TCP_RTO_MAX) rt = TCP_RTO_MAX;
+    t.rto = rt;
+}
+
+/* kumulatif ACK: kapsanan onaysiz slotlari temizle (kaynaktan en eskiye dogru devamli). */
+static void ack_slots(Tcb& t, uint32_t ack) {
+    while (t.txb[t.tx_tail].pend &&
+           (uint32_t)(t.txb[t.tx_tail].seq + t.txb[t.tx_tail].len) <= ack) {
+        t.txb[t.tx_tail].pend = false;
+        t.tx_tail = (t.tx_tail + 1) % TCP_TXQ;
+    }
+}
+
+/* onay ilerledikce pencere buyume (slow-start -> congestion avoidance). */
+static void cwnd_ack(Tcb& t) {
+    uint32_t mss = t.mss ? t.mss : (uint32_t)TCP_MSS;
+    if (t.cwnd < t.ssthresh) t.cwnd += mss;
+    else t.cwnd += (mss * mss) / (t.cwnd ? t.cwnd : mss);
+}
+
+/* hizli yeniden gonderim: en eski onaysiz segment + klasik (Reno-ish) pencere kirma. */
+static void fast_retrans(Tcb& t) {
+    TxSlot& sl = t.txb[t.tx_tail];
+    if (!sl.pend) return;
+    tcp_emit(t, sl.seq, TCP_FLAG_ACK | TCP_FLAG_PSH, sl.data, sl.len, false);
+    sl.sent_at = timer_get_ticks();
+    uint32_t mss = t.mss ? t.mss : (uint32_t)TCP_MSS;
+    uint32_t h = t.cwnd / 2;
+    t.ssthresh = h > 2u * mss ? h : 2u * mss;
+    t.cwnd = t.ssthresh;
+    t.dupacks = 0;
 }
 
 static uint32_t rxr_push(Tcb& t, const uint8_t* p, uint32_t n) {
@@ -654,6 +721,7 @@ void handle_tcp(const uint8_t* ip, uint16_t iplen, const uint8_t* eth_src) {
                 o += olen;
             }
             if (t.mss == 0 || t.mss > TCP_MSS) t.mss = TCP_MSS;
+            t.snd_wnd = rd16(tt + 14);                /* peer penceresi */
             t.st = 2; t.st_v = 2;
             t.done = true; t.ok = true;
         }
@@ -673,9 +741,11 @@ void handle_tcp(const uint8_t* ip, uint16_t iplen, const uint8_t* eth_src) {
                 ch.iss = (uint32_t)((timer_get_ticks() << 12) ^ (uint32_t)(uintptr_t)tt ^ 0x4D2BC3A1u);
                 ch.snd_una = ch.snd_nxt = ch.iss + 1;
                 ch.rcv_nxt = seq + 1;
-                ch.snd_wnd = TCP_MSS;
+                ch.snd_wnd = 65535;          /* peer penceresi ESTAB olurken okunur */
                 ch.mss = TCP_MSS;
-                ch.rto = TCP_RTO0; ch.rtx_at = 0; ch.dupacks = 0;
+                ch.rto = TCP_RTO0; ch.srtt = 0; ch.rttvar = 0; ch.dupacks = 0;
+                ch.cwnd = TCP_CWND_INIT; ch.ssthresh = TCP_SSTHRESH_INIT;
+                ch.tx_head = ch.tx_tail = 0;
                 ch.ok = false; ch.done = false; ch.err = false;
                 ch.fin_tx = ch.fin_rx = false;
                 ch.win_update = false;
@@ -691,6 +761,7 @@ void handle_tcp(const uint8_t* ip, uint16_t iplen, const uint8_t* eth_src) {
     if (t.st == 9) {                             /* SYN_RECV: ACK beklenir */
         if ((flags & TCP_FLAG_ACK) && seq == t.rcv_nxt - 1 + 1) {
             t.snd_una = ack;
+            t.snd_wnd = rd16(tt + 14);                /* peer penceresi */
             t.st = 2; t.st_v = 2;
             t.done = true; t.ok = true;
         }
@@ -699,19 +770,17 @@ void handle_tcp(const uint8_t* ip, uint16_t iplen, const uint8_t* eth_src) {
 
     /* ESTABLISHED ve kapanis durumlari */
     if (flags & TCP_FLAG_ACK) {
+        t.snd_wnd = rd16(tt + 14);
         if (ack > t.snd_una && ack <= t.snd_nxt) {
+            rtt_update(t);                       /* en eski onaysiz slotun sent_at'indan */
+            ack_slots(t, ack);                   /* kumulatif onayli slotlari bosalt */
             t.snd_una = ack;
             t.dupacks = 0;
-            t.rto = TCP_RTO0;
-            if (t.txq.pending && ack >= t.txq.seq + t.txq.len) t.txq.pending = false;
-            if (t.st == 3 && t.fin_tx && ack >= t.fin_seq + 1) t.st = 4;   /* FINW1 -> FINW2 */
+            cwnd_ack(t);                         /* slow-start / congestion avoidance */
+            if (t.st == 3 && t.fin_tx && ack >= (uint32_t)(t.fin_seq + 1)) t.st = 4;   /* FINW1 -> FINW2 */
         } else if (ack == t.snd_una) {
-            if (++t.dupacks == 3 && t.txq.pending) {   /* hizli yeniden gonderim */
-                tcp_emit(t, t.txq.seq, TCP_FLAG_ACK | TCP_FLAG_PSH, t.txq.data, t.txq.len, false);
-                t.dupacks = 0;
-            }
+            if (++t.dupacks == 3) fast_retrans(t);   /* hizli yeniden gonderim */
         }
-        t.snd_wnd = rd16(tt + 14);
     }
 
     bool fin_now = (flags & TCP_FLAG_FIN) != 0;
@@ -767,10 +836,11 @@ static void sock_reset(int s) {
     t.rcv_nxt = 0;
     t.snd_wnd = TCP_MSS;
     t.mss = TCP_MSS;
-    t.rto = TCP_RTO0; t.rtx_at = 0; t.dupacks = 0;
+    t.rto = TCP_RTO0; t.srtt = 0; t.rttvar = 0; t.dupacks = 0;
+    t.cwnd = TCP_CWND_INIT; t.ssthresh = TCP_SSTHRESH_INIT;
+    t.tx_head = t.tx_tail = 0;
     t.win_update = false;
     t.ack_want = false; t.ack_inv = 0; t.ack_at = 0; t.last_ack = 0;
-    t.txq.pending = false;
     t.rxr_w = t.rxr_fill = 0; t.rlen = 0;
 }
 
@@ -818,13 +888,31 @@ extern "C" bool net_tcp_send(int s, const uint8_t* data, uint16_t len) {
     Tcb& t = conns[s];
     if (!t.used || (t.st != 2 && t.st != 3 && t.st != 5)) return false;
     if (len > TCP_MSS) len = TCP_MSS;
-    t.txq.pending = true;
-    t.txq.seq = t.snd_nxt;
-    t.txq.len = len;
-    memcpy(t.txq.data, data, len);
-    tcp_emit(t, t.snd_nxt, TCP_FLAG_ACK | TCP_FLAG_PSH, data, len, false);
+    if (len > t.mss) len = t.mss;
+    if (!len) return false;
+
+    /* sender penceresi: min(peer kabulu, cwnd) asilmaz; slot sistemi onaysizlari tutar.
+       Pencere kapaliysa ACK gelene kadar beklenir (iptal duyarli). */
+    uint64_t wdd = timer_get_ticks() + 2000;         /* ~20 sn tavan */
+    while (true) {
+        uint32_t inflight = (uint32_t)(t.snd_nxt - t.snd_una);
+        uint32_t win = t.snd_wnd;
+        uint32_t cw  = t.cwnd;
+        if (cw < win) win = cw;
+        bool full = (t.tx_head == t.tx_tail && t.txb[t.tx_head].pend);
+        if (!full && inflight + (uint32_t)len <= win) break;
+        if (t.err || t.done || sys_intr_pending() || timer_get_ticks() >= wdd) return false;
+        net_tcp_wait(s, 1);
+    }
+    TxSlot& sl = t.txb[t.tx_head];
+    sl.seq = t.snd_nxt;
+    sl.len = len;
+    memcpy(sl.data, data, len);
+    sl.sent_at = timer_get_ticks();
+    sl.pend = true;
     t.snd_nxt += len;
-    t.rtx_at = timer_get_ticks() + (t.rto + 49) / 50;
+    t.tx_head = (uint8_t)((t.tx_head + 1) % TCP_TXQ);
+    tcp_emit(t, sl.seq, TCP_FLAG_ACK | TCP_FLAG_PSH, data, len, false);
     return true;
 }
 
