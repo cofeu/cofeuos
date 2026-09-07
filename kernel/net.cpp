@@ -434,6 +434,7 @@ constexpr int    TCP_RX_RING = 8192;        /* soket basina gelen veri tamponu *
 constexpr int    TCP_OOO_MAX = 4;           /* soket basina siralamasi bekleyen segment kapi */
 constexpr int    TCP_SOCKS   = 8;           /* eszamanli soket sayisi */
 constexpr int    TCP_TXQ     = 8;           /* soket basina onaysiz (in-flight) segment kapi */
+constexpr int    TCP_BACKLOG = 6;           /* LISTEN'de onaysiz (SYN_RECV) cocuk siniri */
 constexpr uint32_t TCP_RTO0  = 500;         /* ilk RTO (ms) */
 constexpr uint32_t TCP_RTO_MIN = 200;
 constexpr uint32_t TCP_RTO_MAX = 3000;
@@ -465,6 +466,7 @@ struct Tcb {
     uint32_t    ip;          /* peer adres */
     uint16_t    sport, dport;
     uint32_t    iss;         /* bizim ilk seq */
+    volatile uint64_t created_at; /* LISTEN cocugu olusma ani (accept sirasi) */
     volatile uint32_t snd_una;   /* onaysiz en eski seq */
     volatile uint32_t snd_nxt;   /* sonraki gonderilecek seq */
     volatile uint32_t rcv_nxt;   /* peer'dan beklenen seq */
@@ -810,6 +812,10 @@ void handle_tcp(const uint8_t* ip, uint16_t iplen, const uint8_t* eth_src) {
 
     if (t.st == 8) {                             /* LISTEN: gelen SYN -> kiz soket */
         if ((flags & TCP_FLAG_SYN) && !(flags & TCP_FLAG_ACK)) {
+            int pend = 0;                        /* onaysiz (SYN_RECV) cocuk sayisi = accept yigin boyutu */
+            for (int i = 0; i < TCP_SOCKS; i++)
+                if (conns[i].used && conns[i].lfd == s && conns[i].st == 9) pend++;
+            if (pend >= TCP_BACKLOG) return;     /* yigin dolu: SYN'i yanitsiz birak (peer yineler) */
             int c = -1;
             for (int i = 0; i < TCP_SOCKS; i++) if (!conns[i].used) { c = i; break; }
             if (c < 0) {                             /* slot yok: en eski TIME_WAIT'i feda et */
@@ -824,6 +830,7 @@ void handle_tcp(const uint8_t* ip, uint16_t iplen, const uint8_t* eth_src) {
                 ch.sport = dst_port;
                 ch.dport = src_port;
                 ch.iss = (uint32_t)((timer_get_ticks() << 12) ^ (uint32_t)(uintptr_t)tt ^ 0x4D2BC3A1u);
+                ch.created_at = timer_get_ticks();
                 ch.snd_una = ch.snd_nxt = ch.iss + 1;
                 ch.rcv_nxt = seq + 1;
                 ch.snd_wnd = 65535;          /* peer penceresi ESTAB olurken okunur */
@@ -1036,6 +1043,7 @@ static void sock_reset(int s) {
     t.cwnd = TCP_CWND_INIT; t.ssthresh = TCP_SSTHRESH_INIT;
     t.tx_head = t.tx_tail = 0;
     t.win_update = false;
+    t.created_at = 0;
     t.tw_at = t.close_at = 0;
     t.ack_want = false; t.ack_inv = 0; t.ack_at = 0; t.last_ack = 0;
     t.rxr_w = t.rxr_fill = 0; t.rlen = 0;
@@ -1173,12 +1181,17 @@ extern "C" int net_tcp_accept(int s, uint32_t ticks) {
     if (s < 0 || s >= TCP_SOCKS || !conns[s].used) return -1;
     uint64_t dead = ticks ? timer_get_ticks() + ticks : 0;
     for (;;) {
+        int best = -1;
+        uint64_t bt = ~0ull;
         for (int i = 0; i < TCP_SOCKS; i++) {
             if (i == s) continue;
             if (conns[i].used && conns[i].lfd == s && conns[i].st == 2) {
-                conns[i].done = false; conns[i].err = false;
-                return i;                       /* kabul edilecek soket */
+                if (conns[i].created_at < bt) { bt = conns[i].created_at; best = i; }
             }
+        }
+        if (best >= 0) {
+            conns[best].done = false; conns[best].err = false;
+            return best;                       /* kabul edilecek soket (ilk gelen) */
         }
         if (dead && timer_get_ticks() >= dead) return -1;
         if (sys_intr_pending()) return -1;
