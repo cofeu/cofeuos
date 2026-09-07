@@ -522,69 +522,74 @@ static void run_line_inner(char* line, uint32_t& cwd, char* cwdstr, const char* 
                 while (*ps >= '0' && *ps <= '9') { pv = pv * 10u + (uint32_t)(*ps - '0'); ps++; }
                 if (pv > 0 && pv < 65536) port = (uint16_t)pv;
             }
-            kprintf("httpd: %u portunda dinleniyor...\n", port);
-            for (;;) {
-                if (sys_intr_pending()) { kprintf("httpd: iptal edildi\n"); break; }
-                if (!net_tcp_listen(port)) { kprintf("httpd: dinleme basarisiz\n"); break; }
-                if (!net_tcp_accept(300)) {
-                    if (sys_intr_pending()) { sys_intr_clear(); kprintf("httpd: iptal edildi\n"); }
-                    else kprintf("httpd: baglanti zaman asimi\n");
-                    break;
+            int lfd = net_socket();
+            if (lfd < 0) { kprintf("httpd: soket yok\n"); }
+            else if (!net_tcp_listen(lfd, port)) kprintf("httpd: dinleme basarisiz\n");
+            else {
+                kprintf("httpd: %u portunda dinleniyor...\n", port);
+                for (;;) {
+                    if (sys_intr_pending()) { kprintf("httpd: iptal edildi\n"); break; }
+                    int cfd = net_tcp_accept(lfd, 0);      /* 0 = sonsuz bekleyis; Ctrl+C iptal eder */
+                    if (cfd < 0) {
+                        if (sys_intr_pending()) { sys_intr_clear(); kprintf("httpd: iptal edildi\n"); }
+                        else kprintf("httpd: accept hatasi\n");
+                        break;
+                    }
+                    /* Istek basligini topla ("\r\n\r\n" a kadar) */
+                    static char req[4096];
+                    uint32_t rn = 0;
+                    int empty = 0;
+                    uint64_t req_wall = timer_get_ticks() + 300;
+                    while (rn < sizeof(req) - 1 && timer_get_ticks() < req_wall && !sys_intr_pending()) {
+                        uint8_t c;
+                        if (net_tcp_recv_some(cfd, &c, 1, 5) == 1) {
+                            req[rn++] = (char)c;
+                            if (c == '\n') empty++;
+                            else if (c != '\r') empty = 0;
+                            if (empty >= 2) break;
+                        } else if (net_tcp_done(cfd) || net_tcp_err(cfd)) break;
+                    }
+                    req[rn] = 0;
+                    kprintf("httpd: geldi (%u bayt)\n", rn);
+                    /* Yolu cikar: "GET /pat HTTP/1.1" */
+                    char path[256] = "/";
+                    if (req[0] == 'G' && req[1] == 'E' && req[2] == 'T') {
+                        const char* s = req + 4;
+                        while (*s == ' ') s++;
+                        int pl = 0;
+                        while (*s && *s != ' ' && pl < 254) path[pl++] = *s++;
+                        if (pl) path[pl] = 0;
+                    }
+                    fs::EntryInfo st;
+                    char body[8192];
+                    uint32_t bl = 0;
+                    static char resp[9000];
+                    int rlen = 0;
+                    const char* ctype = "text/plain";
+                    if (fs::stat(0, path, &st) && st.type_ == 1) {
+                        if (!fs::read_file(0, path, body, sizeof(body), &bl)) { bl = 0; }
+                        rlen = ksnprintf(resp, sizeof(resp),
+                            "HTTP/1.0 200 OK\r\nContent-Type: %s\r\nContent-Length: %u\r\n\r\n",
+                            ctype, bl);
+                        memcpy(resp + rlen, body, bl > 0 ? bl : 0);
+                        rlen += (int)bl;
+                    } else {
+                        rlen = ksnprintf(resp, sizeof(resp),
+                            "HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                    }
+                    /* Govdeyi segmentlere bolerek gonder */
+                    uint32_t off = 0;
+                    while (off < (uint32_t)rlen && !sys_intr_pending()) {
+                        uint32_t chunk = (uint32_t)(rlen - off);
+                        if (chunk > 1460) chunk = 1460;
+                        net_tcp_send(cfd, (const uint8_t*)resp + off, (uint16_t)chunk);
+                        net_tcp_wait(cfd, 10);
+                        off += chunk;
+                    }
+                    kprintf("httpd: %u bayt yanit gonderildi\n", rlen);
+                    net_tcp_close(cfd);
+                    sys_intr_clear();
                 }
-                /* Istek basligini topla ("\r\n\r\n" a kadar) */
-                static char req[4096];
-                uint32_t rn = 0;
-                int empty = 0;
-                uint64_t req_wall = timer_get_ticks() + 300;
-                while (rn < sizeof(req) - 1 && timer_get_ticks() < req_wall && !sys_intr_pending()) {
-                    uint8_t c;
-                    if (net_tcp_recv_some(&c, 1, 5) == 1) {
-                        req[rn++] = (char)c;
-                        if (c == '\n') empty++;
-                        else if (c != '\r') empty = 0;
-                        if (empty >= 2) break;
-                    } else if (net_tcp_done() || net_tcp_err()) break;
-                }
-                req[rn] = 0;
-                kprintf("httpd: geldi (%u bayt)\n", rn);
-                /* Yolu cikar: "GET /pat HTTP/1.1" */
-                char path[256] = "/";
-                if (req[0] == 'G' && req[1] == 'E' && req[2] == 'T') {
-                    const char* s = req + 4;
-                    while (*s == ' ') s++;
-                    int pl = 0;
-                    while (*s && *s != ' ' && pl < 254) path[pl++] = *s++;
-                    if (pl) path[pl] = 0;
-                }
-                fs::EntryInfo st;
-                char body[8192];
-                uint32_t bl = 0;
-                static char resp[9000];
-                int rlen = 0;
-                const char* ctype = "text/plain";
-                if (fs::stat(0, path, &st) && st.type_ == 1) {
-                    if (!fs::read_file(0, path, body, sizeof(body), &bl)) { bl = 0; }
-                    rlen = ksnprintf(resp, sizeof(resp),
-                        "HTTP/1.0 200 OK\r\nContent-Type: %s\r\nContent-Length: %u\r\n\r\n",
-                        ctype, bl);
-                    memcpy(resp + rlen, body, bl > 0 ? bl : 0);
-                    rlen += (int)bl;
-                } else {
-                    rlen = ksnprintf(resp, sizeof(resp),
-                        "HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n");
-                }
-                /* Govdeyi segmentlere bolerek gonder */
-                uint32_t off = 0;
-                while (off < (uint32_t)rlen && !sys_intr_pending()) {
-                    uint32_t chunk = (uint32_t)(rlen - off);
-                    if (chunk > 1460) chunk = 1460;
-                    net_tcp_send((const uint8_t*)resp + off, (uint16_t)chunk);
-                    net_tcp_wait(10);
-                    off += chunk;
-                }
-                kprintf("httpd: %u bayt yanit gonderildi\n", rlen);
-                net_tcp_close();
-                sys_intr_clear();
             }
         }
     }

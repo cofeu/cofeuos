@@ -20,19 +20,21 @@ void     net_ifconfig(void);
 bool     net_active(void);
 uint32_t net_parse_ip(const char* s, bool* ok);
 
-/* --- tam TCP (RFC 793/1122/6298) --- */
-bool     net_tcp_connect(uint32_t ip, uint16_t port);          /* aktif acilis (engelleyici) */
-bool     net_tcp_send(const uint8_t* data, uint16_t len);      /* tek segment gonder */
-uint32_t net_tcp_recv(uint8_t* out, uint32_t cap);             /* gelen veriyi bosalt */
-void     net_tcp_wait(uint32_t ticks);                         /* done/err veya zaman asimi */
-void     net_tcp_poll(void);                                   /* retransmisyon zamanlayicisi */
-void     net_tcp_close(void);                                  /* aktif FIN kapanisi */
-bool     net_tcp_active(void);                                 /* veri alisverisinde mi */
-bool     net_tcp_done(void);                                   /* kapanis/kurulus (FIN) alindi */
-bool     net_tcp_err(void);                                    /* RST / hata */
-uint32_t net_tcp_pending(void);                                /* rxr'de bekleyen bayt */
-bool     net_tcp_listen(uint16_t port);                        /* pasif acilis (LISTEN) */
-bool     net_tcp_accept(uint32_t ticks);                       /* SYN el sikismasini bekle */
-uint32_t net_tcp_recv_some(uint8_t* out, uint32_t cap, uint32_t ticks); /* veri veya zaman asimi */
+/* --- tam TCP (RFC 793/1122/6298) --- coklu soket: fd = net_socket() --- */
+int      net_socket(void);                                       /* yeni bos soket (fd) veya -1 */
+bool     net_tcp_connect(int s, uint32_t ip, uint16_t port);     /* aktif acilis (engelleyici) */
+bool     net_tcp_send(int s, const uint8_t* data, uint16_t len); /* tek segment gonder */
+uint32_t net_tcp_recv(int s, uint8_t* out, uint32_t cap);        /* gelen veriyi bosalt */
+void     net_tcp_wait(int s, uint32_t ticks);                    /* done/err veya zaman asimi */
+void     net_tcp_poll(int s);                                    /* retransmisyon zamanlayicisi */
+void     net_tcp_poll_all(void);                                 /* tum soketler icin zamanlayici */
+void     net_tcp_close(int s);                                   /* aktif FIN kapanisi */
+bool     net_tcp_active(int s);                                  /* veri alisverisinde mi */
+bool     net_tcp_done(int s);                                    /* kapanis/kurulus (FIN) alindi */
+bool     net_tcp_err(int s);                                     /* RST / hata */
+uint32_t net_tcp_pending(int s);                                 /* rxr'de bekleyen bayt */
+bool     net_tcp_listen(int s, uint16_t port);                   /* pasif acilis (LISTEN) */
+int      net_tcp_accept(int s, uint32_t ticks);                  /* kabul edilen soket (fd) veya -1 */
+uint32_t net_tcp_recv_some(int s, uint8_t* out, uint32_t cap, uint32_t ticks); /* veri veya zaman asimi */
 
 }
