@@ -17,6 +17,7 @@ uint32_t net_get_ip(void);
 uint32_t net_get_mask(void);
 uint32_t net_get_gw(void);
 void     net_ifconfig(void);
+void     net_sockdump(void);                                /* TCP soket durumlari */
 bool     net_active(void);
 uint32_t net_parse_ip(const char* s, bool* ok);
 

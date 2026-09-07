@@ -393,6 +393,10 @@ static void run_line_inner(char* line, uint32_t& cwd, char* cwdstr, const char* 
         if (!net_active()) kprintf("hata: ag arayuzu yok/aktif degil\n");
         else net_ifconfig();
     }
+    else if (strcmp(cmd, "sock") == 0) {
+        if (!net_active()) kprintf("hata: ag arayuzu yok/aktif degil\n");
+        else net_sockdump();
+    }
     else if (strcmp(cmd, "dhcp") == 0) {
         if (!net_active()) kprintf("hata: ag arayuzu yok/aktif degil\n");
         else if (net_dhcp()) {
