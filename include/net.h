@@ -36,5 +36,6 @@ uint32_t net_tcp_pending(int s);                                 /* rxr'de bekle
 bool     net_tcp_listen(int s, uint16_t port);                   /* pasif acilis (LISTEN) */
 int      net_tcp_accept(int s, uint32_t ticks);                  /* kabul edilen soket (fd) veya -1 */
 uint32_t net_tcp_recv_some(int s, uint8_t* out, uint32_t cap, uint32_t ticks); /* veri veya zaman asimi */
+bool     net_frag_selftest(void);                                /* IPv4 parca birlestirme testi */
 
 }

@@ -604,6 +604,11 @@ static void run_line_inner(char* line, uint32_t& cwd, char* cwdstr, const char* 
                     (gw >> 24) & 0xFF, (gw >> 16) & 0xFF, (gw >> 8) & 0xFF, gw & 0xFF);
             if (!net_ping(gw)) { ok = false; step = 1; }
 
+            if (ok) {
+                kprintf("nettest: adim1b ip parcalama/birlestirme ...\n");
+                if (!net_frag_selftest()) { ok = false; step = 5; }
+            }
+
             uint32_t dip = 0;
             if (ok) {
                 kprintf("nettest: adim2 dns google.com ...\n");

@@ -901,6 +901,115 @@ void handle_tcp(const uint8_t* ip, uint16_t iplen, const uint8_t* eth_src) {
     }
 }
 
+/* ---- IPv4 parcalama / birlestirme (RFC 791) ---- */
+struct IpFrag {
+    bool     used;
+    uint32_t src;
+    uint16_t id;
+    uint8_t  proto;
+    uint16_t got;
+    uint16_t tot;
+};
+IpFrag ipfrags[2];
+uint8_t ipf_buf[2][65556];
+uint64_t ipf_expire = 0;
+
+static void ipf_clear(int i) {
+    ipfrags[i].used = false; ipfrags[i].got = 0; ipfrags[i].tot = 0;
+}
+
+static void ip_dispatch(const uint8_t* ip, uint16_t iplen, const uint8_t* eth_src) {
+    if (ip[9] == 1) handle_icmp(ip, iplen, eth_src);
+    else if (ip[9] == 17) handle_udp(ip, iplen, eth_src);
+    else if (ip[9] == 6) handle_tcp(ip, iplen, eth_src);
+}
+
+void handle_ipv4(const uint8_t* ip, uint16_t iplen, const uint8_t* eth_src) {
+    uint16_t frag = rd16(ip + 6);
+    bool mf = (frag & 0x2000) != 0;
+    uint32_t off = (uint32_t)(frag & 0x1FFF) * 8u;
+    if (!mf && !off) { ip_dispatch(ip, iplen, eth_src); return; }
+
+    uint64_t now = timer_get_ticks();
+    if (now >= ipf_expire) { ipf_expire = now + 200; for (int i = 0; i < 2; i++) ipf_clear(i); }
+
+    uint16_t ihl = (uint16_t)((ip[0] & 0x0F) * 4u);
+    if (ihl < 20 || iplen <= ihl) return;
+    uint16_t pl = (uint16_t)(iplen - ihl);
+    if ((uint32_t)off + pl > 65535u - 20u) return;
+
+    uint32_t src = rd32(ip + 12);
+    uint16_t id = rd16(ip + 4);
+    int s = -1;
+    for (int i = 0; i < 2; i++)
+        if (ipfrags[i].used && ipfrags[i].src == src && ipfrags[i].id == id && ipfrags[i].proto == ip[9]) { s = i; break; }
+    if (s < 0)
+        for (int i = 0; i < 2; i++)
+            if (!ipfrags[i].used) { s = i; break; }
+    if (s < 0) return;
+
+    IpFrag& F = ipfrags[s];
+    uint8_t* pb = ipf_buf[s] + 20;
+    if (off == 0) {
+        F.used = true; F.src = src; F.id = id; F.proto = ip[9]; F.got = 0; F.tot = 0;
+        memcpy(ipf_buf[s], ip, 20);
+    }
+    memcpy(pb + off, ip + ihl, pl);
+    uint32_t end = off + (uint32_t)pl;
+    if (end > F.got) F.got = (uint16_t)end;
+    if (!mf) F.tot = (uint16_t)end;
+    ipf_expire = now + 200;
+
+    if (F.tot && F.got >= F.tot) {
+        wr16(ipf_buf[s] + 2, (uint16_t)(20 + F.tot));
+        wr16(ipf_buf[s] + 6, 0);
+        ip_dispatch(ipf_buf[s], (uint16_t)(20 + F.tot), eth_src);
+        ipf_clear(s);
+    }
+}
+
+/*
+ * Yapay parcali ICMP istek ile birlestirmeyi dogrular.
+ * iki parca birlestimce echo yanitini tetiklemeli (stat_tx +1).
+ */
+extern "C" bool net_frag_selftest(void) {
+    if (!net_active()) return false;
+    uint8_t f0[20 + 80], f1[20 + 40];
+    memset(f0, 0, sizeof(f0));
+    memset(f1, 0, sizeof(f1));
+
+    uint8_t pay[120];
+    memset(pay, 0, sizeof(pay));
+    pay[0] = 8;                              /* echo istek */
+    pay[1] = 0;
+    wr16(pay + 4, 0x1234);                   /* identifier */
+    wr16(pay + 6, 1);                        /* sequence */
+    wr16(pay + 2, ip_checksum(pay, sizeof(pay)));
+
+    uint32_t gw = net_get_gw();
+
+    auto mk = [&](uint8_t* ip, uint16_t frag, uint16_t plen) {
+        ip[0] = 0x45; ip[1] = 0;
+        wr16(ip + 2, (uint16_t)(20 + plen));
+        wr16(ip + 4, 0x4567);
+        wr16(ip + 6, frag);
+        ip[8] = 64; ip[9] = 1;
+        wr32(ip + 12, gw);
+        wr32(ip + 16, our_ip);
+        wr16(ip + 10, ip_checksum(ip, 20));
+    };
+
+    mk(f0, 0x2000, 80);                  /* MF=1, offset 0 */
+    mk(f1, 10,     40);                  /* MF=0, offset 80/8=10 */
+    memcpy(f0 + 20, pay, 80);
+    memcpy(f1 + 20, pay + 80, 40);
+
+    uint64_t t0 = stat_tx;
+    handle_ipv4(f0, sizeof(f0), NULL);
+    handle_ipv4(f1, sizeof(f1), NULL);
+    return stat_tx == t0 + 1;
+}
+
 /* --- soket katmani: fd = conns[] indeksi --- */
 static void sock_reset(int s) {
     Tcb& t = conns[s];
@@ -1148,13 +1257,7 @@ extern "C" void net_handle_eth(const uint8_t* frame, uint16_t len) {
         uint16_t iplen = rd16(ip + 2);           /* IP toplam uzunlugu (FCS/padding yok) */
         uint16_t avail = (uint16_t)(len - 14);
         if (iplen > avail) iplen = avail;         /* kaynaga guvenme */
-        if (ip[9] == 1) {
-            handle_icmp(ip, iplen, frame);
-        } else if (ip[9] == 17) {
-            handle_udp(ip, iplen, frame + 6);
-        } else if (ip[9] == 6) {
-            handle_tcp(ip, iplen, frame + 6);
-        }
+        handle_ipv4(ip, iplen, frame + 6);
     }
 }
 
