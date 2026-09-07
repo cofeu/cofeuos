@@ -11,6 +11,7 @@ volatile int tail = 0;
 bool shift = false;
 bool caps = false;
 bool extended = false;
+bool ctrl = false;
 
 static const char normal[128] = {
     0, 27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
@@ -44,6 +45,7 @@ extern "C" void keyboard_init(void) {
     shift = false;
     caps = false;
     extended = false;
+    ctrl = false;
 }
 
 extern "C" void keyboard_irq(void) {
@@ -55,14 +57,20 @@ extern "C" void keyboard_irq(void) {
     uint8_t sc = code & 0x7F;
 
     if (released) {
-        if (extended) { extended = false; return; }
+        if (extended) {
+            extended = false;
+            if (sc == 0x1D) ctrl = false;
+            return;
+        }
         if (sc == 0x2A || sc == 0x36) shift = false;
+        if (sc == 0x1D) ctrl = false;
         return;
     }
 
     if (extended) {
         extended = false;
         switch (sc) {
+        case 0x1D: ctrl = true; return;
         case 0x48: push((char)0x80); return;
         case 0x50: push((char)0x81); return;
         case 0x4B: push((char)0x82); return;
@@ -73,8 +81,14 @@ extern "C" void keyboard_irq(void) {
 
     switch (sc) {
     case 0x2A: case 0x36: shift = true; return;
+    case 0x1D: ctrl = true; return;
     case 0x3A: caps = !caps; return;
     default: break;
+    }
+
+    if (ctrl && sc == 0x2E) {           /* Ctrl+C */
+        sys_intr_set();
+        return;
     }
 
     if (sc >= 128) return;

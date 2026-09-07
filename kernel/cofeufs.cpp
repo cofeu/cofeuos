@@ -11,6 +11,9 @@
  *   LBA 2130..   : veri bloklari (512B)
  *
  * Inode (128B): name[32] u16 type u16 rsv u32 size u32 blocks[22]
+ *    blocks[0..19]  : dogrudan veri bloklari
+ *    blocks[20..21] : 2 indirect tablo (her biri 128 x u32 blok no = 512B)
+ *    -> max dosya: (20 + 2*128) blok * 512B = 141312B
  * Dizin girdisi (40B): u32 ino char name[32] u8 type u8 pad[3]  (12/blok)
  */
 
@@ -33,8 +36,11 @@ constexpr uint16_t FT_DIR  = 2;
 constexpr uint32_t INO_SIZE    = 128;
 constexpr uint32_t INO_PER_BLK = 512 / INO_SIZE;      /* 4 */
 constexpr uint32_t INO_COUNT   = INO_BLOCKS * INO_PER_BLK;
-constexpr uint32_t MAX_BLOCKS  = 22;
-constexpr uint32_t MAX_FILE    = MAX_BLOCKS * 512;
+constexpr uint32_t MAX_DIRECT  = 20;                  /* dogrudan blok sayisi */
+constexpr uint32_t IND_PTRS    = 512 / 4;             /* indirect tablo boslugu: 128 */
+constexpr uint32_t MAX_INDIRECT = 2;                  /* blocks[20..21] indirect tablolar */
+constexpr uint32_t MAX_BLOCKS  = MAX_DIRECT + MAX_INDIRECT;   /* 22 -> inode boyutu korunur */
+constexpr uint32_t MAX_FILE    = (MAX_DIRECT + MAX_INDIRECT * IND_PTRS) * 512;  /* 141312 */
 
 constexpr uint32_t DE_SIZE    = 40;
 constexpr uint32_t DE_PER_BLK = 512 / DE_SIZE;         /* 12 */
@@ -140,16 +146,82 @@ static void block_free(uint32_t n) {
 }
 
 static void inode_free_blocks(Inode& in) {
-    for (uint32_t i = 0; i < MAX_BLOCKS; i++) {
+    for (uint32_t i = 0; i < MAX_DIRECT; i++) {
         if (in.blocks[i] != 0xFFFFFFFF && in.blocks[i] < DATA_COUNT) {
             block_free(in.blocks[i]);
             in.blocks[i] = 0xFFFFFFFF;
         }
     }
+    for (uint32_t t = 0; t < MAX_INDIRECT; t++) {
+        uint32_t tbl = in.blocks[MAX_DIRECT + t];
+        if (tbl == 0xFFFFFFFF || tbl >= DATA_COUNT) continue;
+        disk_read(DATA_LBA + tbl, sec);
+        uint32_t* ptrs = (uint32_t*)sec;
+        for (uint32_t j = 0; j < IND_PTRS; j++)
+            if (ptrs[j] != 0xFFFFFFFF && ptrs[j] < DATA_COUNT) block_free(ptrs[j]);
+        block_free(tbl);
+        in.blocks[MAX_DIRECT + t] = 0xFFFFFFFF;
+    }
 }
 
 static void inode_reset(Inode& in) {
     for (uint32_t i = 0; i < MAX_BLOCKS; i++) in.blocks[i] = 0xFFFFFFFF;
+}
+
+/* mantiksal blok no -> LBA. indirect tablolar diskten okunur. */
+static bool inode_block_at(const Inode& in, uint32_t bi, uint32_t& lba) {
+    if (bi < MAX_DIRECT) {
+        if (in.blocks[bi] == 0xFFFFFFFF) return false;
+        lba = in.blocks[bi];
+        return true;
+    }
+    bi -= MAX_DIRECT;
+    uint32_t t = bi / IND_PTRS, j = bi % IND_PTRS;
+    if (t >= MAX_INDIRECT) return false;
+    uint32_t tbl = in.blocks[MAX_DIRECT + t];
+    if (tbl == 0xFFFFFFFF || tbl >= DATA_COUNT) return false;
+    disk_read(DATA_LBA + tbl, sec);
+    uint32_t idx = ((uint32_t*)sec)[j];
+    if (idx == 0xFFFFFFFF || idx >= DATA_COUNT) return false;
+    lba = idx;
+    return true;
+}
+
+/* siradaki bos blok yuvalarina yeni veri blogu ayir (direct, sonra indirect). */
+static bool inode_map_next(Inode& in, uint32_t& out_lba) {
+    for (uint32_t i = 0; i < MAX_DIRECT; i++) {
+        if (in.blocks[i] == 0xFFFFFFFF) {
+            uint32_t idx;
+            if (!block_alloc(idx)) return false;
+            in.blocks[i] = idx;
+            out_lba = idx;
+            return true;
+        }
+    }
+    for (uint32_t t = 0; t < MAX_INDIRECT; t++) {
+        uint32_t tbl = in.blocks[MAX_DIRECT + t];
+        if (tbl == 0xFFFFFFFF) {
+            if (!block_alloc(tbl)) return false;
+            in.blocks[MAX_DIRECT + t] = tbl;
+            uint32_t* z = (uint32_t*)sec;
+            for (uint32_t k = 0; k < IND_PTRS; k++) z[k] = 0xFFFFFFFF;   /* bos sentinel */
+            disk_write(DATA_LBA + tbl, sec);
+        }
+        if (tbl >= DATA_COUNT) return false;
+        disk_read(DATA_LBA + tbl, sec);
+        uint32_t* ptrs = (uint32_t*)sec;
+        for (uint32_t j = 0; j < IND_PTRS; j++) {
+            if (ptrs[j] == 0xFFFFFFFF) {
+                uint32_t idx;
+                if (!block_alloc(idx)) return false;
+                ptrs[j] = idx;
+                disk_write(DATA_LBA + tbl, sec);
+                out_lba = idx;
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 /* ---- dizin girdileri (slot) ---- */
@@ -487,6 +559,14 @@ bool create_file(uint32_t base, const char* path) { return create_inode(base, pa
 bool mkdir(uint32_t base, const char* path)       { return create_inode(base, path, true); }
 
 /* -------- yazma / okuma -------- */
+static bool write_file_abort(Inode& in, uint32_t ino) {
+    inode_free_blocks(in);
+    in.size = 0;
+    inode_write(ino, in);
+    bm_flush();
+    return false;
+}
+
 bool write_file(uint32_t base, const char* path, const void* data, uint32_t len) {
     if (!mounted) return false;
     uint32_t ino;
@@ -497,7 +577,10 @@ bool write_file(uint32_t base, const char* path, const void* data, uint32_t len)
     Inode in;
     inode_read(ino, in);
     if (in.type != FT_FILE) return false;
-    if (len > MAX_FILE) return false;
+    if (len > MAX_FILE) {
+        kslog("fs: yazma reddedildi, cok buyuk (%u > %u)\n", len, MAX_FILE);
+        return false;
+    }
 
     inode_free_blocks(in);
     inode_reset(in);
@@ -506,23 +589,18 @@ bool write_file(uint32_t base, const char* path, const void* data, uint32_t len)
     uint32_t need = (len + 511) / 512;
     for (uint32_t i = 0; i < need; i++) {
         uint32_t idx;
-        if (!block_alloc(idx)) {
-            inode_free_blocks(in);
-            in.size = 0;
-            inode_write(ino, in);
-            bm_flush();
-            return false;
-        }
-        in.blocks[i] = idx;
+        if (!inode_map_next(in, idx)) return write_file_abort(in, ino);
     }
 
     const uint8_t* src = (const uint8_t*)data;
     for (uint32_t i = 0; i < need; i++) {
+        uint32_t lba;
+        if (!inode_block_at(in, i, lba)) return write_file_abort(in, ino);
         memset(sec, 0, 512);
         uint32_t chunk = 512;
         if (i == need - 1) chunk = len - i * 512;
         memcpy(sec, src + i * 512, chunk);
-        disk_write(DATA_LBA + in.blocks[i], sec);
+        disk_write(DATA_LBA + lba, sec);
     }
 
     inode_write(ino, in);
@@ -545,8 +623,9 @@ bool append_file(uint32_t base, const char* path, const void* data, uint32_t len
     for (uint32_t i = 0; i < (cur + 511) / 512; i++) {
         uint32_t chunk = 512;
         if (i == (cur - 1) / 512) chunk = cur - i * 512;
-        uint32_t lba = DATA_LBA + in.blocks[i];
-        disk_read(lba, sec);
+        uint32_t lba;
+        if (!inode_block_at(in, i, lba)) return false;
+        disk_read(DATA_LBA + lba, sec);
         memcpy(tmp + i * 512, sec, chunk);
     }
     memcpy(tmp + cur, data, len);
@@ -566,8 +645,9 @@ bool read_file(uint32_t base, const char* path, void* buf, uint32_t maxlen, uint
     for (uint32_t i = 0; i < (to_read + 511) / 512; i++) {
         uint32_t chunk = 512;
         if (i == (to_read - 1) / 512) chunk = to_read - i * 512;
-        uint32_t lba = DATA_LBA + in.blocks[i];
-        disk_read(lba, sec);
+        uint32_t lba;
+        if (!inode_block_at(in, i, lba)) return false;
+        disk_read(DATA_LBA + lba, sec);
         memcpy(dst + i * 512, sec, chunk);
     }
     if (out_len) *out_len = to_read;

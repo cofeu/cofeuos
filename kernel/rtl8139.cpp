@@ -22,7 +22,7 @@ constexpr     uint16_t OFF_RCR        = 0x44;
 constexpr     uint16_t OFF_CONFIG1    = 0x52;
 constexpr     uint16_t OFF_HLTCLK     = 0x5B;
 
-constexpr uint32_t RX_BUF_SIZE = 0x4000;   /* 16KB */
+constexpr uint32_t RX_BUF_SIZE = 0x10000;  /* 64KB (RCR RBS=11) */
 
 uint16_t io = 0;
 uint8_t  mac[6];
@@ -32,34 +32,41 @@ uint8_t* tx_buf = NULL;
 bool     up = false;
 uint8_t  tx_idx = 0;   /* QEMU donen Tx descriptor indeksi (0..3) */
 
-void process_rx(void) {
+void rx_overflow_recover(void) {
     uint16_t cbr = inw(io + OFF_CBR);
-    while (rx_cur != (cbr & 0x3FFF)) {
+    kslog("rtl8139 RXOVW cbr=%u\n", (unsigned)cbr);
+    rx_cur = cbr;                                   /* cihazin yazma konumuna hizala */
+    outw(io + OFF_CAPR, (uint16_t)(cbr - 16));      /* overflow'u veriyle temizle */
+}
+
+void process_rx(void) {
+    static uint8_t tmp[65536];
+    uint16_t cbr = inw(io + OFF_CBR);
+    while (rx_cur != cbr) {
         const uint8_t* d = rx_buf + rx_cur;
         uint32_t hdr;
         memcpy(&hdr, d, 4);
-        uint16_t size   = (uint16_t)(hdr >> 16);
+        uint16_t size   = (uint16_t)(hdr >> 16);    /* cerceve + 4 (CRC dahil) */
         uint16_t status = (uint16_t)(hdr & 0xFFFF);
 
-        if ((status & 0x0001) == 0) {         /* ROK yok: tamponu sifirla */
-            rx_cur = 0;
-            outw(io + OFF_CAPR, 0);
-            return;
+        if ((status & 0x0001) == 0) {               /* ROK yok: henuz yazilmadi */
+            kslog("rtl8139 ROK yok rx_cur=%u cbr=%u hdr=%08x (bekleniyor)\n",
+                  (unsigned)rx_cur, (unsigned)cbr, (unsigned)hdr);
+            break;                                  /* ringi SIFIRLAMA, tekrar dene */
         }
 
         if (rx_cur + 4u + size > RX_BUF_SIZE) {
-            /* kesme (ring sonu) durumu: iki parcaya bolunmus paket */
-            uint8_t tmp[1518];
-            uint32_t part1 = RX_BUF_SIZE - rx_cur - 4;
-            uint32_t remain = (uint32_t)size - part1;
-            if (part1 + remain > sizeof(tmp)) { rx_cur = 0; outw(io + OFF_CAPR, 0); return; }
+            /* ring sonunu asan (sarmalanmis) paket: parca1 ucta, devam offset 0'da */
+            uint32_t part1  = RX_BUF_SIZE - rx_cur - 4;         /* gercek verinin ucta kalan kismi */
+            uint32_t remain = (uint32_t)size - 4u - part1;      /* CRC haric, ring basindaki kalan */
+            if (part1 + remain > sizeof(tmp)) { rx_overflow_recover(); break; }
             memcpy(tmp, rx_buf + rx_cur + 4, part1);
-            memcpy(tmp + part1, rx_buf + 4, remain);   /* 2. descriptor ring basinda */
-            net_handle_eth(tmp, size);
-            rx_cur = (4u + remain + 3u) & 0x3FFCu;
+            memcpy(tmp + part1, rx_buf, remain);                /* surekli kismi ring basinda */
+            net_handle_eth(tmp, size - 4);
+            rx_cur = (4u + remain + 3u) & (RX_BUF_SIZE - 4);    /* sonraki descriptor */
         } else {
-            net_handle_eth(d + 4, size);
-            rx_cur = (rx_cur + 4u + size + 3u) & 0x3FFCu;
+            net_handle_eth(d + 4, size - 4);
+            rx_cur = (rx_cur + 4u + size + 3u) & (RX_BUF_SIZE - 4);
         }
 
         cbr = inw(io + OFF_CBR);
@@ -83,8 +90,9 @@ extern "C" bool rtl8139_init(uint16_t io_base, uint8_t irq, uint8_t bus, uint8_t
     outb(io + OFF_CR, 0x10);                   /* soft reset */
     for (int i = 0; i < 1000 && (inb(io + OFF_CR) & 0x10); i++) io_wait();
 
-    rx_buf = (uint8_t*)pmm_alloc_range(4);     /* 16KB, sayfa hizali */
+    rx_buf = (uint8_t*)pmm_alloc_range(32);    /* 128KB; 64K hizaya yuvarla (gercek HW) */
     if (!rx_buf) { kslog("rtl8139: rx tampon ayrilamadi\n"); return false; }
+    rx_buf = (uint8_t*)(((uintptr_t)rx_buf + 0xFFFFu) & ~(uintptr_t)0xFFFFu);
     memset(rx_buf, 0, RX_BUF_SIZE);
     rx_cur = 0;
 
@@ -96,7 +104,7 @@ extern "C" bool rtl8139_init(uint16_t io_base, uint8_t irq, uint8_t bus, uint8_t
 
     outw(io + OFF_IMR, 0x0005);                /* ROK + TOK */
     outl(io + OFF_TCR, 0);
-    outl(io + OFF_RCR, 0x0000080Fu);           /* 16K ring + promiscuous + wrap */
+    outl(io + OFF_RCR, 0x0000180Fu);           /* 64K ring (RBS=11) + promiscuous + wrap */
 
     outb(io + OFF_CR, 0x0C);                   /* TE + RE */
     outw(io + OFF_ISR, 0xFFFF);                /* eski kesmeleri temizle */
@@ -114,7 +122,7 @@ extern "C" void rtl8139_send(const void* data, uint16_t len) {
     memcpy(tx_buf, data, len);
 
     outl(io + OFF_TX_START + tx_idx * 4u, (uint32_t)(uintptr_t)tx_buf);  /* TSADn */
-    outl(io + OFF_TX_STATUS + tx_idx * 4u, (uint32_t)(len & 0x1FFF));    /* TSDn */
+    outl(io + OFF_TX_STATUS + tx_idx * 4u, (uint32_t)(len & 0x1FFF));    /* TSDn  */
 
     for (int i = 0; i < 500000; i++) {           /* TOK (bit15) gelene kadar bekle */
         if (inl(io + OFF_TX_STATUS + tx_idx * 4u) & 0x8000u) break;
@@ -128,8 +136,8 @@ extern "C" void rtl8139_poll(void) {
     uint16_t isr = inw(io + OFF_ISR);
     if (!(isr & 0x0001u)) return;
     outw(io + OFF_ISR, isr);
-    if (isr & 0x0010u) { rx_cur = 0; outw(io + OFF_CAPR, 0); }  /* RXOVW */
-    if (isr & 0x0001u) process_rx();                       /* ROK */
+    if (isr & 0x0010u) rx_overflow_recover();      /* RXOVW */
+    if (isr & 0x0001u) process_rx();              /* ROK */
 }
 
 extern "C" void rtl8139_irq(void) {
@@ -137,7 +145,7 @@ extern "C" void rtl8139_irq(void) {
     uint16_t isr = inw(io + OFF_ISR);
     if (!isr) return;
     outw(io + OFF_ISR, isr);                     /* hepsini ack'le */
-    if (isr & 0x0010u) { rx_cur = 0; outw(io + OFF_CAPR, 0); }  /* RXOVW */
+    if (isr & 0x0010u) rx_overflow_recover();    /* RXOVW: ringi sifirlama, hizala */
     if (isr & 0x0001u) process_rx();             /* ROK */
 }
 

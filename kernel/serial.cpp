@@ -34,5 +34,7 @@ extern "C" bool serial_has_char(void) {
 
 extern "C" char serial_getc(void) {
     if (!(inb(COM1 + 5) & 0x01)) return 0;
-    return (char)inb(COM1);
+    char c = (char)inb(COM1);
+    if (c == 0x03) sys_intr_set();    /* seri uzerinden Ctrl+C */
+    return c;
 }

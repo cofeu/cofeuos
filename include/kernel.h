@@ -62,6 +62,12 @@ void serial_write(const char* s);
 bool serial_has_char(void);
 char serial_getc(void);
 
+/* Ctrl+C (iptal) sinyali */
+void  sys_intr_set(void);
+void  sys_intr_clear(void);
+bool  sys_intr_pending(void);
+void  sys_intr_poll(void);
+
 /* ---- GDT / IDT / IRQ ---- */
 void gdt_init(void);
 void idt_init(void);

@@ -1,6 +1,18 @@
 #include "kernel.h"
 #include "x86.h"
 
+static volatile bool g_intr_pending = false;
+
+/* ---- Ctrl+C (iptal) sinyali ---- */
+extern "C" void sys_intr_set(void)   { g_intr_pending = true; }
+extern "C" void sys_intr_clear(void) { g_intr_pending = false; }
+extern "C" bool sys_intr_pending(void) { return g_intr_pending; }
+
+/* Bekleyen (poll) islerin her turunedok cagrilir: seriden 0x03 (Ctrl+C) bayraga cerçevirir. */
+extern "C" void sys_intr_poll(void) {
+    if (serial_has_char() && serial_getc() == 0x03) g_intr_pending = true;
+}
+
 extern "C" {
 
 void* memset(void* dst, int v, size_t n) {
