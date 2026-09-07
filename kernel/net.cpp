@@ -36,6 +36,11 @@ volatile bool     ping_done   = false;
 volatile uint16_t ping_ident  = 0;
 volatile uint32_t ping_reply_src = 0;
 
+/* ---- ICMP destination-unreachable -> soket notu (handle_icmp doldurur, poll isler) ---- */
+struct IcmpUr { volatile bool pend; volatile bool tcp;
+                volatile uint32_t ip; volatile uint16_t sport, dport; };
+IcmpUr icmp_ur = { false, false, 0, 0, 0 };
+
 /* ---- big-endian yardimci ------ */
 uint16_t rd16(const uint8_t* p) { return (uint16_t)((p[0] << 8) | p[1]); }
 uint32_t rd32(const uint8_t* p) {
@@ -201,6 +206,17 @@ void handle_icmp(const uint8_t* ip, uint16_t len, const uint8_t* eth_src) {
             ping_reply_src = rd32(ip + 12);
             ping_done = true;
         }
+    } else if (icmp[0] == 3) {                          /* destination unreachable -> TCP soket haberi */
+        /* geri gonderim: orijinal IP basligi + en az 8 bayt TCP basligi */
+        if (iclen < 8 + 20 + 8) return;
+        const uint8_t* oip = icmp + 8;
+        uint16_t oihl = (uint16_t)((oip[0] & 0x0F) * 4u);
+        if (oihl < 20 || iclen < 8 + oihl + 8) return;
+        icmp_ur.ip = rd32(oip + 12);
+        icmp_ur.sport = rd16(oip + oihl);
+        icmp_ur.dport = rd16(oip + oihl + 2);
+        icmp_ur.tcp = (oip[9] == 6);
+        icmp_ur.pend = true;
     }
 }
 
@@ -438,6 +454,7 @@ constexpr int    TCP_BACKLOG = 6;           /* LISTEN'de onaysiz (SYN_RECV) cocu
 constexpr uint32_t TCP_RTO0  = 500;         /* ilk RTO (ms) */
 constexpr uint32_t TCP_RTO_MIN = 200;
 constexpr uint32_t TCP_RTO_MAX = 3000;
+constexpr uint32_t TCP_MAX_RETRANS = 12;    /* ardarda RTO'da vazgec (RST/err) */
 constexpr uint32_t TCP_CWND_INIT = 4 * (uint32_t)TCP_MSS;     /* slow-start baslangic penceresi */
 constexpr uint32_t TCP_SSTHRESH_INIT = 64 * (uint32_t)TCP_MSS;
 constexpr int      TCP_SACK_BLK_MAX  = 3;   /* ACK basina iletilen SACK blogu */
@@ -481,6 +498,10 @@ struct Tcb {
     TxSlot    txb[TCP_TXQ];
     bool fin_tx, fin_rx;
     uint32_t  fin_seq;       /* FIN'imizin seq'i */
+    volatile bool fin_pend;      /* FIN gonderildi henuz onaylanmadi */
+    volatile uint64_t fin_sent_at;
+    volatile uint64_t probe_at;  /* sonraki sifir-pencere probe ani */
+    volatile uint32_t retries;   /* ardarda RTO retransmisyon sayaci */
     uint64_t  tw_at;         /* TIME_WAIT sayaci */
     uint64_t  close_at;      /* FINW1/FINW2 limit (aktif kapanis devam sureci) */
     volatile bool ok, done, err;
@@ -594,12 +615,48 @@ static int ts_pick(Tcb& t) {
     return fallback;
 }
 
+/* vazgecme: gorunen baglantiyi hata ile kapat (RST almis gibi). */
+static void tcp_abort(Tcb& t) {
+    t.err = true; t.done = true; t.ok = false;
+    t.used = 0; t.st = 0; t.st_v = 0;
+}
+
+/* ICMP destination-unreachable notunu eslesen TCP sokete uygula. */
+static void icmp_apply(void) {
+    if (!icmp_ur.pend) return;
+    if (icmp_ur.tcp) {
+        for (int i = 0; i < TCP_SOCKS; i++) {
+            Tcb& c = conns[i];
+            if (c.used && c.st != 8 && c.sport == icmp_ur.sport &&
+                c.dport == icmp_ur.dport && c.ip == icmp_ur.ip) { tcp_abort(c); break; }
+        }
+    }
+    icmp_ur.pend = false;
+}
+
 void tcp_poll(Tcb& t) {
     if (!t.used || t.st == 0 || t.st == 1) return;
+    icmp_apply();
     if (t.ack_want && t.rcv_nxt != t.last_ack && timer_get_ticks() >= t.ack_at) tcp_ack_now(t);
     if (t.st == 7) {                       /* TIME_WAIT sayaci */
         if (timer_get_ticks() >= t.tw_at) { t.used = 0; t.st = 0; t.ok = true; t.done = true; }
         return;
+    }
+    /* sifir-pencere persist probe (RFC 1122 4.2.2.17): penceresi kapaliyken 1 baytlk yoklama */
+    if (t.snd_wnd == 0 && t.snd_una != t.snd_nxt &&
+        timer_get_ticks() >= t.probe_at && !t.fin_pend) {
+        uint8_t one = 0xAA;                                  /* sifir-pencere yoklama (pencere=0) */
+        tcp_emit(t, t.snd_nxt, TCP_FLAG_ACK | TCP_FLAG_PSH, &one, 1, false, false);
+        t.probe_at = timer_get_ticks() + ((t.rto + 49) / 50);
+    }
+    /* FIN retransmisyonu (FINW1 / LAST_ACK): veri slotuna girmedigi icin ayri izlenir */
+    if (t.fin_pend &&
+        timer_get_ticks() - t.fin_sent_at >= (uint64_t)((t.rto + 49) / 50)) {
+        if (++t.retries > TCP_MAX_RETRANS) { tcp_abort(t); return; }
+        tcp_emit(t, t.fin_seq, TCP_FLAG_FIN | TCP_FLAG_ACK, NULL, 0, false, false);
+        t.fin_sent_at = timer_get_ticks();
+        if (t.rto < TCP_RTO_MAX) t.rto *= 2;
+        if (t.rto > TCP_RTO_MAX) t.rto = TCP_RTO_MAX;
     }
     if (t.st == 3 || t.st == 4) {          /* aktif kapanis: peer FIN'i bekle; sure sinirli */
         if (timer_get_ticks() >= t.close_at) { t.used = 0; t.st = 0; }
@@ -609,6 +666,7 @@ void tcp_poll(Tcb& t) {
     int pi = ts_pick(t);
     if (pi >= 0 && t.snd_una == t.txb[pi].seq &&
         timer_get_ticks() - t.txb[pi].sent_at >= (uint64_t)((t.rto + 49) / 50)) {
+        if (++t.retries > TCP_MAX_RETRANS) { tcp_abort(t); return; }
         TxSlot& sl = t.txb[pi];
         tcp_emit(t, sl.seq, TCP_FLAG_ACK | TCP_FLAG_PSH, sl.data, sl.len, false, false);
         sl.sent_at = timer_get_ticks();
@@ -840,6 +898,7 @@ void handle_tcp(const uint8_t* ip, uint16_t iplen, const uint8_t* eth_src) {
                 ch.tx_head = ch.tx_tail = 0;
                 ch.ok = false; ch.done = false; ch.err = false;
                 ch.fin_tx = ch.fin_rx = false;
+                ch.fin_pend = false; ch.fin_sent_at = 0; ch.probe_at = 0; ch.retries = 0;
                 ch.close_at = 0;
                 ch.win_update = false;
                 ch.ack_want = false; ch.ack_inv = 0; ch.ack_at = 0; ch.last_ack = 0;
@@ -870,8 +929,14 @@ void handle_tcp(const uint8_t* ip, uint16_t iplen, const uint8_t* eth_src) {
             ack_slots(t, ack);                   /* kumulatif onayli slotlari bosalt */
             t.snd_una = ack;
             t.dupacks = 0;
+            t.retries = 0;
             cwnd_ack(t);                         /* slow-start / congestion avoidance */
-            if (t.st == 3 && t.fin_tx && ack >= (uint32_t)(t.fin_seq + 1)) { t.st = 4; t.close_at = timer_get_ticks() + 200; }   /* FINW1 -> FINW2 */
+            if (t.st == 3 && t.fin_tx && ack >= (uint32_t)(t.fin_seq + 1)) {
+                t.st = 4; t.close_at = timer_get_ticks() + 200; t.fin_pend = false;   /* FINW1 -> FINW2 */
+            }
+            else if (t.st == 6 && t.fin_tx && ack >= (uint32_t)(t.fin_seq + 1)) {
+                t.fin_pend = false; t.used = 0; t.st = 0; t.st_v = 0;                /* LAST_ACK -> KAPALI */
+            }
         } else if (ack == t.snd_una) {
             if (++t.dupacks == 3) fast_retrans(t);   /* hizli yeniden gonderim */
         }
@@ -1037,6 +1102,7 @@ static void sock_reset(int s) {
     t.fin_tx = t.fin_rx = false;
     t.snd_una = t.snd_nxt = 0;
     t.rcv_nxt = 0;
+    t.fin_pend = false; t.fin_sent_at = 0; t.probe_at = 0; t.retries = 0;
     t.snd_wnd = TCP_MSS;
     t.mss = TCP_MSS;
     t.rto = TCP_RTO0; t.srtt = 0; t.rttvar = 0; t.dupacks = 0;
@@ -1242,6 +1308,7 @@ extern "C" void net_tcp_close(int s) {
         t.snd_nxt += 1;
         t.st = 3;
         t.close_at = timer_get_ticks() + 200;       /* ~2sn peer FIN bekle */
+        t.fin_pend = true; t.fin_sent_at = timer_get_ticks();
         tcp_emit(t, t.fin_seq, TCP_FLAG_FIN | TCP_FLAG_ACK, NULL, 0, false, false);
         net_tcp_wait(s, 120);                       /* ~1.2s FINW1/FINW2/CLOSE beklenir */
     } else if (t.st == 5) {                         /* pasif taraf: LAST_ACK */
@@ -1249,6 +1316,7 @@ extern "C" void net_tcp_close(int s) {
         t.fin_seq = t.snd_nxt;
         t.snd_nxt += 1;
         t.st = 6;
+        t.fin_pend = true; t.fin_sent_at = timer_get_ticks();
         tcp_emit(t, t.fin_seq, TCP_FLAG_FIN | TCP_FLAG_ACK, NULL, 0, false, false);
         net_tcp_wait(s, 60);
     }
