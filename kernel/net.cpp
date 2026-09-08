@@ -65,6 +65,11 @@ uint16_t ip_checksum(const uint8_t* d, int len) {
 }
 
 /* ---- Ethernet gonderimi ---- */
+volatile bool  ethsnoop = false;                  /* tx test yakalama */
+volatile int   ethsnoop_n = 0;
+volatile uint16_t ethsnoop_len[4];
+uint8_t ethsnoop_frame[4][1500];
+
 void eth_send(const uint8_t* dmac, uint16_t type, const uint8_t* payload, uint16_t len) {
     uint8_t frame[1514];
     memcpy(frame, dmac, 6);
@@ -72,6 +77,11 @@ void eth_send(const uint8_t* dmac, uint16_t type, const uint8_t* payload, uint16
     frame[12] = (uint8_t)(type >> 8);
     frame[13] = (uint8_t)(type & 0xFF);
     memcpy(frame + 14, payload, len);
+    if (ethsnoop && ethsnoop_n < 4) {
+        ethsnoop_len[ethsnoop_n] = (uint16_t)(len + 14);
+        memcpy(ethsnoop_frame[ethsnoop_n], frame, (len + 14 > 1500) ? 1500 : (len + 14));
+        ethsnoop_n++;
+    }
     rtl8139_send(frame, (uint16_t)(len + 14));
     stat_tx++;
 }
@@ -158,22 +168,12 @@ void handle_arp(const uint8_t* f, uint16_t len) {
 }
 
 /* ---- IPv4 ---- */
+/* Max parca verisi: MTU(1500) - IP basligi(20) = 1480; 8 baytlk kata yuvarlanir. */
+constexpr uint16_t IP_MF   = 0x2000;
+constexpr uint16_t IP_FRAG_MAX = 1480;
+
 void ip_send(uint32_t dst, const uint8_t* dmac, uint8_t proto,
              const uint8_t* payload, uint16_t len) {
-    uint8_t buf[20 + 1500];
-    buf[0] = 0x45; buf[1] = 0;
-    uint16_t tot = (uint16_t)(20 + len);
-    wr16(buf + 2, tot);
-    static uint16_t ip_id = 0x1000;
-    wr16(buf + 4, ++ip_id);
-    wr16(buf + 6, 0);
-    buf[8] = 64; buf[9] = proto;
-    wr16(buf + 10, 0);                    /* checksum sonra */
-    wr32(buf + 12, our_ip);
-    wr32(buf + 16, dst);
-    wr16(buf + 10, ip_checksum(buf, 20));
-    memcpy(buf + 20, payload, len);
-
     uint8_t tmpmac[6];
     if (!dmac) {
         uint32_t l2dst = dst;
@@ -182,6 +182,48 @@ void ip_send(uint32_t dst, const uint8_t* dmac, uint8_t proto,
         if (!arp_resolve(l2dst, tmpmac)) return;
         dmac = tmpmac;
     }
+
+    static uint16_t ip_id = 0x1000;
+    uint16_t id = ++ip_id;
+
+    if (len > IP_FRAG_MAX) {                     /* parcalamak gerekiyor (RFC 791) */
+        uint16_t off = 0;
+        while (off < len) {
+            uint16_t chunk = len - off;
+            bool last = true;
+            if (chunk > IP_FRAG_MAX) {
+                chunk = IP_FRAG_MAX;             /* 1480 zaten 8 hizali */
+                last = false;
+            }
+            uint8_t buf[20 + IP_FRAG_MAX];
+            buf[0] = 0x45; buf[1] = 0;
+            wr16(buf + 2, (uint16_t)(20 + chunk));
+            wr16(buf + 4, id);
+            wr16(buf + 6, (uint16_t)((last ? 0 : IP_MF) | (off / 8)));
+            buf[8] = 64; buf[9] = proto;
+            wr16(buf + 10, 0);
+            wr32(buf + 12, our_ip);
+            wr32(buf + 16, dst);
+            wr16(buf + 10, ip_checksum(buf, 20));
+            memcpy(buf + 20, payload + off, chunk);
+            eth_send(dmac, 0x0800, buf, (uint16_t)(20 + chunk));
+            off = (uint16_t)(off + chunk);
+        }
+        return;
+    }
+
+    uint8_t buf[20 + 1500];
+    buf[0] = 0x45; buf[1] = 0;
+    uint16_t tot = (uint16_t)(20 + len);
+    wr16(buf + 2, tot);
+    wr16(buf + 4, id);
+    wr16(buf + 6, 0);
+    buf[8] = 64; buf[9] = proto;
+    wr16(buf + 10, 0);                    /* checksum sonra */
+    wr32(buf + 12, our_ip);
+    wr32(buf + 16, dst);
+    wr16(buf + 10, ip_checksum(buf, 20));
+    memcpy(buf + 20, payload, len);
     eth_send(dmac, 0x0800, buf, tot);
 }
 
@@ -235,7 +277,7 @@ uint16_t udp_checksum(uint32_t saddr, uint32_t daddr, const uint8_t* u, uint16_t
 }
 
 void udp_send(uint32_t dst, uint16_t dport, uint16_t sport, const uint8_t* data, uint16_t len) {
-    uint8_t u[8 + 1500];
+    uint8_t u[8 + 1480 + 512];
     wr16(u, sport);
     wr16(u + 2, dport);
     wr16(u + 4, (uint16_t)(len + 8));
@@ -1091,6 +1133,41 @@ extern "C" bool net_frag_selftest(void) {
     handle_ipv4(f0, sizeof(f0), NULL);
     handle_ipv4(f1, sizeof(f1), NULL);
     return stat_tx == t0 + 1;
+}
+
+/*
+ * Gonderim parcalama testi: 1700 bayt UDP payloadi 1480+... seklinde
+ * tek id ile parcalanmali; etik yakalayici switch etkisi olmadan
+ * rtl8139'e gider. ethsnoop ile parcalari inceleriz.
+ */
+extern "C" bool net_frag_send_selftest(void) {
+    if (!net_active()) return false;
+
+    static uint8_t big[1700];
+    for (int i = 0; i < 1700; i++) big[i] = (uint8_t)(i & 0xFF);
+
+    /* ARP yok: dogrudan mac vererek ip_send'e tek parcali ver, parcalar boyle olusur */
+    uint8_t dummy_mac[6] = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    uint32_t dst = net_get_gw();
+
+    ethsnoop = true;                 /* onceki snop temizle */
+    ethsnoop_n = 0;
+    ip_send(dst, dummy_mac, 17, big, sizeof(big));
+    ethsnoop = false;
+
+    if (ethsnoop_n != 2) return false;          /* 1700 -> 1480 + 220 */
+
+    /* her IKisi: ethertype IP, ip id ayni, MF/offset dogru, total <= MTU */
+    const uint8_t* f0 = ethsnoop_frame[0] + 14;        /* ip + 14 = eth payload */
+    const uint8_t* f1 = ethsnoop_frame[1] + 14;
+    if (rd16(ethsnoop_frame[0] + 12) != 0x0800) return false;
+    if (rd16(ethsnoop_frame[1] + 12) != 0x0800) return false;
+    if (rd16(f0 + 4) != rd16(f1 + 4))          return false;   /* ayni id */
+    if (rd16(f0 + 6) != 0x2000)                return false;   /* MF=1, off=0 */
+    if (rd16(f1 + 6) != (1480 / 8))            return false;   /* MF=0, off=185 */
+    if (ethsnoop_len[0] > 1514)                return false;
+    if (ethsnoop_len[1] > 1514)                return false;
+    return true;
 }
 
 /* --- soket katmani: fd = conns[] indeksi --- */

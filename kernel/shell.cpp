@@ -613,6 +613,11 @@ static void run_line_inner(char* line, uint32_t& cwd, char* cwdstr, const char* 
                 if (!net_frag_selftest()) { ok = false; step = 5; }
             }
 
+            if (ok) {
+                kprintf("nettest: adim1c ip gonderim parcalama ...\n");
+                if (!net_frag_send_selftest()) { ok = false; step = 6; }
+            }
+
             uint32_t dip = 0;
             if (ok) {
                 kprintf("nettest: adim2 dns google.com ...\n");
