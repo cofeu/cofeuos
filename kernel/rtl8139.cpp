@@ -154,3 +154,24 @@ extern "C" void rtl8139_get_mac(uint8_t out[6]) {
 }
 
 extern "C" bool rtl8139_active(void) { return up; }
+
+namespace {
+static void nic_send(const uint8_t* frame, uint16_t len) { rtl8139_send(frame, len); }
+static void nic_poll(void) { rtl8139_poll(); }
+static void nic_irq(void)  { rtl8139_irq(); }
+static const NicOps rtl8139_ops = { nic_send, nic_poll, nic_irq, rtl8139_active };
+}
+
+extern "C" bool rtl8139_nic_probe(const PCIDevice* pci, NicDevice* out) {
+    if (up) return false;                                  /* tek ornek */
+    if (pci->vendor_id != 0x10EC || pci->device_id != 0x8139) return false;
+    uint16_t io_base = (uint16_t)(pci->bar0 & 0xFFFCu);
+    if (!rtl8139_init(io_base, pci->irq, pci->bus, pci->slot, pci->func)) return false;
+    out->name = "rtl8139";
+    out->kind = NIC_WIRED;
+    out->irq  = pci->irq;
+    out->up   = true;
+    rtl8139_get_mac(out->mac);
+    out->ops  = &rtl8139_ops;
+    return true;
+}

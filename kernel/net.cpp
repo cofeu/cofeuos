@@ -1,6 +1,6 @@
 #include "kernel.h"
 #include "x86.h"
-#include "rtl8139.h"
+#include "nic.h"
 #include "net.h"
 
 namespace {
@@ -82,7 +82,7 @@ void eth_send(const uint8_t* dmac, uint16_t type, const uint8_t* payload, uint16
         memcpy(ethsnoop_frame[ethsnoop_n], frame, (len + 14 > 1500) ? 1500 : (len + 14));
         ethsnoop_n++;
     }
-    rtl8139_send(frame, (uint16_t)(len + 14));
+    nic_send(frame, (uint16_t)(len + 14));
     stat_tx++;
 }
 
@@ -1194,7 +1194,7 @@ static void sock_reset(int s) {
 
 /* yeni (bos) soket: fd veya -1 */
 extern "C" int net_socket(void) {
-    if (!rtl8139_active()) return -1;
+    if (!nic_up()) return -1;
     for (int i = 0; i < TCP_SOCKS; i++)
         if (!conns[i].used) { sock_reset(i); return i; }
     uint64_t best = ~0ull; int c = -1;              /* dolu: en eski TIME_WAIT'i feda et */
@@ -1308,7 +1308,7 @@ extern "C" uint32_t net_tcp_pending(int s) {
 
 extern "C" bool net_tcp_listen(int s, uint16_t port) {
     if (s < 0 || s >= TCP_SOCKS || !conns[s].used) return false;
-    if (!rtl8139_active()) return false;
+    if (!nic_up()) return false;
     Tcb& t = conns[s];
     t.st = 8; t.st_v = 8;
     t.dport = 0;                 /* peer henuz bilinmiyor */
@@ -1504,7 +1504,7 @@ extern "C" bool net_dhcp(void) {
 }
 
 extern "C" bool net_dns_resolve(const char* name, uint32_t* out_ip) {
-    if (!rtl8139_active()) return false;
+    if (!nic_up()) return false;
     if (!name || !*name) return false;
     uint32_t server = dns_server ? dns_server : 0x0A000203u;
 
@@ -1534,7 +1534,7 @@ extern "C" bool net_dns_resolve(const char* name, uint32_t* out_ip) {
 
 extern "C" bool net_http_get(uint32_t ip, uint16_t port, const char* host,
                              const char* path, char* out, int out_cap) {
-    if (!rtl8139_active()) return false;
+    if (!nic_up()) return false;
     if (!out || out_cap <= 0) return false;
     if (!host || !*host) host = "10.0.2.2";
     if (!path || !*path) path = "/";
@@ -1608,7 +1608,7 @@ extern "C" uint32_t net_get_ip(void) { return our_ip; }
 extern "C" uint32_t net_get_mask(void) { return our_mask; }
 extern "C" uint32_t net_get_gw(void) { return gateway; }
 
-extern "C" bool net_active(void) { return rtl8139_active(); }
+extern "C" bool net_active(void) { return nic_up(); }
 
 extern "C" void net_sockdump(void) {
     net_tcp_poll_all();                /* once suresi dolan TIME_WAIT'lari topla */

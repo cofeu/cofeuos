@@ -20,7 +20,8 @@ OBJ = kernel/entry.o kernel/isr.o kernel/main.o kernel/util.o kernel/memory.o \
       kernel/pmm.o kernel/kprintf.o kernel/vga.o kernel/serial.o kernel/gdt.o \
       kernel/idt.o kernel/irq.o kernel/timer.o kernel/keyboard.o kernel/ata.o \
       kernel/cofeufs.o kernel/shell.o kernel/sched.o kernel/user_embed.o \
-      kernel/rtc.o kernel/pci.o kernel/rtl8139.o kernel/net.o
+      kernel/rtc.o kernel/pci.o kernel/mmio.o kernel/nic.o kernel/rtl8139.o \
+      kernel/e1000.o kernel/net.o
 
 DISK_SIZE_SECTORS = 67584
 

@@ -1,6 +1,7 @@
 #include "kernel.h"
 #include "x86.h"
 #include "pmm.h"
+#include "mmio.h"
 #include "sched.h"
 
 #define SCHED_DEBUG 0
@@ -178,6 +179,7 @@ void vm_build(Process& p, const uint64_t* code_frames, int n_pages) {
     pml4p[0] = p.pdpt | 0x7;              /* P|RW|U */
     pdptp[0] = 0x72000 | 0x3;             /* ortak kernel PD (0..1GB), supervisor */
     pdptp[1] = p.pd | 0x7;                /* 0x40000000-0x80000000 penceresi */
+    if (mmio_shared_pd()) pdptp[3] = mmio_shared_pd() | 0x3;  /* 0xC0000000+ MMIO kimligi */
     pdp[0]   = p.pt | 0x7;
 
     p.user_code_pages = n_pages;
