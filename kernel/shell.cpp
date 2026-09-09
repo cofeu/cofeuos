@@ -623,6 +623,11 @@ static void run_line_inner(char* line, uint32_t& cwd, char* cwdstr, const char* 
                 if (!net_rx_harden_selftest()) { ok = false; step = 7; }
             }
 
+            if (ok) {
+                kprintf("nettest: adim1e fast recovery + limited transmit ...\n");
+                if (!net_fast_recovery_selftest()) { ok = false; step = 8; }
+            }
+
             uint32_t dip = 0;
             if (ok) {
                 kprintf("nettest: adim2 dns google.com ...\n");
