@@ -3,6 +3,7 @@
 #include "pmm.h"
 #include "mmio.h"
 #include "sched.h"
+#include "net.h"
 
 #define SCHED_DEBUG 0
 
@@ -280,7 +281,7 @@ extern "C" int sched_spawn(const char* name) {
     Process& p = table[i];
     memset(&p, 0, sizeof(p));
     p.pid      = (uint16_t)pid;
-    p.state    = P_READY;
+    p.state    = P_EMPTY;               /* kurulum bitene kadar secilemez */
     p.kstack   = (uint64_t)k;
 
     int nl = (int)strlen(name);
@@ -293,6 +294,7 @@ extern "C" int sched_spawn(const char* name) {
 
     p.start_tick = timer_get_ticks();
     p.ctx = build_initial_context(p);
+    p.state = P_READY;                   /* adres alani + ctx hazir olunca */
     return (int)p.pid;
 }
 
@@ -471,7 +473,7 @@ extern "C" int sched_exec_file(const char* path) {
     Process& p = table[i];
     memset(&p, 0, sizeof(p));
     p.pid      = (uint16_t)pid;
-    p.state    = P_READY;
+    p.state    = P_EMPTY;              /* hazir olana kadar secilemez (timer IRQ'suna karsi) */
     p.kstack   = (uint64_t)k;
 
     const char* nm = path;
@@ -508,6 +510,7 @@ extern "C" int sched_exec_file(const char* path) {
 
     p.start_tick = timer_get_ticks();
     p.ctx = build_initial_context2(p, elf_entry);
+    p.state = P_READY;                  /* ancak yigin/ctx tam kurulunca secilebilir */
     return (int)p.pid;
 }
 
@@ -667,7 +670,7 @@ extern "C" uint64_t syscall_handle(uint64_t ctx) {
         Process& c = table[slot];
         memset(&c, 0, sizeof(c));
         c.pid      = (uint16_t)pid;
-        c.state    = P_READY;
+        c.state    = P_EMPTY;              /* kurulum bitene kadar secilemez */
         c.kstack   = (uint64_t)k;
         memcpy(c.name, cur->name, 15);
 
@@ -680,6 +683,7 @@ extern "C" uint64_t syscall_handle(uint64_t ctx) {
                 memcpy((void*)c.stk_pages[s], (void*)cur->stk_pages[s], 4096);
 
         c.ctx = build_fork_context(c, r);
+        c.state = P_READY;                 /* ancak ctx kurulunca secilebilir */
         r[OFF_RAX] = c.pid;
         break;
     }
@@ -758,6 +762,43 @@ extern "C" uint64_t syscall_handle(uint64_t ctx) {
         if (!copy_user_path(a0, path, sizeof(path))) { r[OFF_RAX] = (uint64_t)-1; break; }
         return sched_exec_self(ctx, path);      /* surecin imajini degistir, donmez */
     }
+    case SYS_UDPSOCK:
+        r[OFF_RAX] = (uint64_t)net_udp_socket();
+        break;
+    case SYS_UDPBIND:
+        r[OFF_RAX] = net_udp_bind((int)a0, (uint16_t)a1) ? 0 : (uint64_t)-1;
+        break;
+    case SYS_UDPSENDTO: {
+        uint64_t a3 = r[OFF_RCX];
+        uint16_t dport = (uint16_t)(a2 & 0xFFFF);
+        uint16_t dlen  = (uint16_t)(a2 >> 16);
+        if (dlen > 1472 || !uaddr_ok(a3, dlen)) { r[OFF_RAX] = (uint64_t)-1; break; }
+        int n = net_udp_send_to((int)a0, (uint32_t)a1, dport,
+                                (const uint8_t*)a3, dlen);
+        r[OFF_RAX] = (n >= 0) ? (uint64_t)n : (uint64_t)-1;
+        break;
+    }
+    case SYS_UDPWAIT:
+        r[OFF_RAX] = net_udp_wait((int)a0, (uint32_t)a1) ? 1 : 0;
+        break;
+    case SYS_UDPRECVFROM: {
+        uint64_t a3 = r[OFF_RCX];
+        if (!uaddr_ok(a1, a2) || a2 > 1500) { r[OFF_RAX] = (uint64_t)-1; break; }
+        if (a3 && !uaddr_ok(a3, 6)) { r[OFF_RAX] = (uint64_t)-1; break; }
+        uint32_t sip = 0, sp = 0;
+        int n = net_udp_recv_from((int)a0, (uint8_t*)a1, (uint32_t)a2,
+                                  a3 ? &sip : NULL, a3 ? (uint16_t*)&sp : NULL);
+        if (n < 0) { r[OFF_RAX] = (uint64_t)-1; break; }
+        if (a3) {
+            *(uint32_t*)a3     = sip;
+            *(uint16_t*)(a3+4) = (uint16_t)sp;
+        }
+        r[OFF_RAX] = (uint64_t)n;
+        break;
+    }
+    case SYS_UDPCLOSE:
+        r[OFF_RAX] = net_udp_close((int)a0) ? 0 : (uint64_t)-1;
+        break;
     default:
         r[OFF_RAX] = (uint64_t)-1;
         break;

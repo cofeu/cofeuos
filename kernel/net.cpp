@@ -354,24 +354,52 @@ void handle_dhcp(const uint8_t* b, uint16_t avail) {
     }
 }
 
-/* ---- UDP soket kayitlari (kucuk dagitici) ---- */
-typedef void (*udp_cb_t)(uint32_t src_ip, uint16_t src_port, const uint8_t* data, uint16_t len);
-struct UdpSock { bool used; uint16_t dport; udp_cb_t cb; };
-UdpSock udp_socks[8];
+/* ---- UDP soketler (fd tabanli) ----
+   Yerel port ile eslestirilir; gelen datagramlar soket kuyruguna yazilir.
+   Kuyruk ISR/timer yolunda dolar (handle_udp), tuketim syscall/cekirdek
+   baglaminda; tek CPU ilerlemesi + volatile kuyruk sayaci yeterli. */
+enum { UDP_SOCKS = 8, UDP_QLEN = 4, UDP_DGRAM_MAX = 1500 };
 
-int udp_sock_add(uint16_t dport, udp_cb_t cb) {
-    for (int i = 0; i < 8; i++)
+struct UdpDgram {
+    uint32_t src_ip;
+    uint16_t src_port;
+    uint16_t len;
+    uint8_t  data[UDP_DGRAM_MAX];
+};
+
+struct UdpSock {
+    bool              used;
+    bool              bound;
+    uint16_t          lport;
+    int               qr, qw;
+    volatile uint32_t qn;
+    UdpDgram          q[UDP_QLEN];
+};
+UdpSock udp_socks[UDP_SOCKS];
+
+int udp_sock_alloc(void) {
+    for (int i = 0; i < UDP_SOCKS; i++)
         if (!udp_socks[i].used) {
+            memset(&udp_socks[i], 0, sizeof(udp_socks[i]));
             udp_socks[i].used = true;
-            udp_socks[i].dport = dport;
-            udp_socks[i].cb = cb;
             return i;
         }
     return -1;
 }
 
-void udp_sock_remove(int idx) {
-    if (idx >= 0 && idx < 8) udp_socks[idx].used = false;
+int udp_sock_bound(uint16_t port) {
+    for (int i = 0; i < UDP_SOCKS; i++)
+        if (udp_socks[i].used && udp_socks[i].bound && udp_socks[i].lport == port)
+            return i;
+    return -1;
+}
+
+uint16_t udp_auto_port(void) {
+    for (int g = 0; g < 64; g++) {
+        uint16_t p = (uint16_t)(0xC000 | (((timer_get_ticks() * 2654435761u) >> 16) & 0x3FFF));
+        if (udp_sock_bound(p) < 0) return p;
+    }
+    return (uint16_t)(0xC000 + (timer_get_ticks() % 0x3FFF));
 }
 
 void handle_udp(const uint8_t* ip, uint16_t len, const uint8_t* eth_src) {
@@ -389,20 +417,93 @@ void handle_udp(const uint8_t* ip, uint16_t len, const uint8_t* eth_src) {
         handle_dhcp(u + 8, (uint16_t)(ulen - 8));
         return;
     }
-    for (int i = 0; i < 8; i++)
-        if (udp_socks[i].used && udp_socks[i].dport == dport) {
-            udp_socks[i].cb(rd32(ip + 12), sport, u + 8, (uint16_t)(ulen - 8));
-            return;
-        }
+    int s = udp_sock_bound(dport);                         /* dinleyen soket var mi */
+    if (s < 0) return;
+    UdpSock& us = udp_socks[s];
+    if (us.qn >= UDP_QLEN) return;                         /* kuyruk dolu: dusur */
+    UdpDgram& d = us.q[us.qw];
+    d.src_ip   = rd32(ip + 12);
+    d.src_port = sport;
+    d.len = (uint16_t)((ulen - 8 > UDP_DGRAM_MAX) ? UDP_DGRAM_MAX : ulen - 8);
+    memcpy(d.data, u + 8, d.len);
+    us.qw = (us.qw + 1) % UDP_QLEN;
+    us.qn++;
 }
 
-/* ---- DNS (RFC 1035) ---- */
-constexpr uint16_t DNS_SPORT = 5300;    /* gecici kaynak portu */
-volatile bool     dns_waiting = false;
-volatile bool     dns_done = false;
-volatile uint16_t dns_id = 0;
-bool     dns_ok = false;
-uint32_t dns_result = 0;
+/* ---- UDP fd API (kullanici syscall'lari icin) ---- */
+extern "C" int net_udp_socket(void) {
+    if (!nic_up()) return -1;
+    return udp_sock_alloc();
+}
+
+extern "C" bool net_udp_bind(int s, uint16_t port) {
+    if (s < 0 || s >= UDP_SOCKS || !udp_socks[s].used) return false;
+    UdpSock& u = udp_socks[s];
+    if (u.bound) return false;
+    if (port == 0) port = udp_auto_port();
+    if (udp_sock_bound(port) >= 0) return false;
+    u.bound = true;
+    u.lport = port;
+    u.qn = 0; u.qr = 0; u.qw = 0;
+    return true;
+}
+
+extern "C" int net_udp_send_to(int s, uint32_t dst, uint16_t dport,
+                               const uint8_t* data, uint16_t len) {
+    if (s < 0 || s >= UDP_SOCKS || !udp_socks[s].used) return -1;
+    if (!nic_up()) return -1;
+    if (!udp_socks[s].bound && !net_udp_bind(s, 0)) return -1;
+    if (len > 1472) len = 1472;                    /* MTU1500 - IP20 - UDP8 */
+    /* syscall icinde (IF=0) arp_resolve bloke edemez; frame gonderilmeden
+       once ARP tamamlanmasi icin gecici IRQ penceresi ac. */
+    uint64_t fl = 0;
+    asm volatile("pushfq; pop %0" : "=r"(fl));
+    asm volatile("sti");
+    udp_send(dst, dport, udp_socks[s].lport, data, len);
+    asm volatile("push %0; popfq" : : "r"(fl) : "cc", "memory");
+    return (int)len;
+}
+
+extern "C" bool net_udp_wait(int s, uint32_t ticks) {
+    if (s < 0 || s >= UDP_SOCKS || !udp_socks[s].used) return false;
+    uint64_t dd = timer_get_ticks() + ticks;
+    /* int 0x80 interrupt kapisi IF'i kapatir; beklenti timer/NIC IRQ'lari
+       ister (tik ilerlesin, RX işlensin). Kalici IF=1 tehlikeli (syscall
+       yeniden giris), bu yuzden sadece bu dongu boyunca gecici ac. */
+    uint64_t fl = 0;
+    asm volatile("pushfq; pop %0" : "=r"(fl));
+    asm volatile("sti");
+    while (!udp_socks[s].qn && timer_get_ticks() < dd && !sys_intr_pending()) { sys_intr_poll(); cpu_hlt(); }
+    asm volatile("push %0; popfq" : : "r"(fl) : "cc", "memory");
+    return udp_socks[s].qn > 0;
+}
+
+extern "C" int net_udp_recv_from(int s, uint8_t* out, uint32_t cap,
+                                 uint32_t* src_ip, uint16_t* src_port) {
+    if (s < 0 || s >= UDP_SOCKS || !udp_socks[s].used) return -1;
+    UdpSock& u = udp_socks[s];
+    if (!u.qn) return 0;
+    UdpDgram& d = u.q[u.qr];
+    uint16_t n = (uint16_t)((cap < d.len) ? cap : d.len);
+    if (out && n) memcpy(out, d.data, n);
+    if (src_ip)   *src_ip   = d.src_ip;
+    if (src_port) *src_port = d.src_port;
+    u.qr = (u.qr + 1) % UDP_QLEN;
+    u.qn--;
+    return (int)n;
+}
+
+extern "C" bool net_udp_close(int s) {
+    if (s < 0 || s >= UDP_SOCKS || !udp_socks[s].used) return false;
+    udp_socks[s].used  = false;
+    udp_socks[s].bound = false;
+    udp_socks[s].qn    = 0;
+    return true;
+}
+
+/* ---- DNS (RFC 1035) ----
+   Sorgu yapimi ve yanit cozumlemesi saf (state'siz) islevlerdir;
+   ag isi fd tabanli UDP soketleri uzerinden yapilir (net_dns_resolve). */
 
 int dns_qname(uint8_t* out, const char* name) {
     int n = 0;
@@ -442,37 +543,33 @@ int dns_query(uint8_t* b, uint16_t qid, const char* name) {
     return 12 + n + 4;
 }
 
-void dns_cb(uint32_t src_ip, uint16_t src_port, const uint8_t* data, uint16_t len) {
-    (void)src_ip; (void)src_port;
-    if (!dns_waiting || len < 12) return;
-    if (rd16(data) != dns_id) return;               /* eslesen sorgu id */
-    uint16_t flags = rd16(data + 2);
-    if (!(flags & 0x8000)) return;                  /* yanit degil */
+/* DNS yanitindan A kaydini cikar; basarili olursa *out'u doldurup true doner. */
+static bool dns_parse_a(const uint8_t* data, uint16_t len, uint32_t* out) {
+    if (len < 12) return false;
+    if (!(rd16(data + 2) & 0x8000)) return false;        /* yanit (QR) degil */
     uint16_t qd = rd16(data + 4);
     uint16_t an = rd16(data + 6);
     int pos = 12;
     int limit = (int)len;
     for (int i = 0; i < qd; i++) {
         dns_skip_name(data, pos, limit);
-        if (pos < 0) return;
+        if (pos < 0) return false;
         pos += 4;
     }
     for (int i = 0; i < an; i++) {
         dns_skip_name(data, pos, limit);
-        if (pos < 0) return;
-        if (pos + 10 > limit) return;
-        uint16_t type   = rd16(data + pos);
-        uint16_t rdlen  = rd16(data + pos + 8);
+        if (pos < 0) return false;
+        if (pos + 10 > limit) return false;
+        uint16_t type  = rd16(data + pos);
+        uint16_t rdlen = rd16(data + pos + 8);
         pos += 10;
-        if (type == 1 && rdlen == 4 && pos + 4 <= limit) {  /* A kaydi */
-            dns_result = rd32(data + pos);
-            dns_ok = true;
-            dns_done = true;
-            return;
+        if (type == 1 && rdlen == 4 && pos + 4 <= limit) {   /* A kaydi */
+            if (out) *out = rd32(data + pos);
+            return true;
         }
         pos += rdlen;
     }
-    dns_done = true;                                /* yanit geldi, A kaydi yok */
+    return false;
 }
 
 /* ---- TCP (RFC 793/1122/6298): tam cekirdek, tek aktif baglanti ----
@@ -1508,28 +1605,34 @@ extern "C" bool net_dns_resolve(const char* name, uint32_t* out_ip) {
     if (!name || !*name) return false;
     uint32_t server = dns_server ? dns_server : 0x0A000203u;
 
-    for (int attempt = 0; attempt < 3; attempt++) {
-        dns_id = (uint16_t)((timer_get_ticks() + (uint64_t)attempt) * 0x9E37u) | 0x8000u;
+    int s = net_udp_socket();
+    if (s < 0) return false;
+    if (!net_udp_bind(s, 0)) { net_udp_close(s); return false; }
+
+    bool ok = false;
+    uint32_t result = 0;
+    for (int attempt = 0; attempt < 3 && !ok; attempt++) {
+        uint16_t id = (uint16_t)((timer_get_ticks() + (uint64_t)attempt) * 0x9E37u) | 0x8000u;
         uint8_t q[280];
-        int qlen = dns_query(q, dns_id, name);
+        int qlen = dns_query(q, id, name);
         if (qlen < 32) { memset(q + qlen, 0, 32 - qlen); qlen = 32; }
+        net_udp_send_to(s, server, 53, q, (uint16_t)qlen);
 
-        int sock = udp_sock_add(DNS_SPORT, dns_cb);
-        if (sock < 0) return false;
-        dns_waiting = true; dns_done = false; dns_ok = false;
-        udp_send(server, 53, DNS_SPORT, q, (uint16_t)qlen);
-
+        uint8_t r[512];
         uint64_t t = timer_get_ticks() + 100;        /* 1 sn bekleyis */
-        while (!dns_done && timer_get_ticks() < t && !sys_intr_pending()) { sys_intr_poll(); cpu_hlt(); }
-        dns_waiting = false;
-        udp_sock_remove(sock);
-
-        if (dns_done) {
-            if (out_ip && dns_ok) *out_ip = dns_result;
-            return dns_ok;
+        while (!ok && timer_get_ticks() < t && !sys_intr_pending()) {
+            sys_intr_poll();
+            int got = net_udp_recv_from(s, r, sizeof(r), NULL, NULL);
+            if (got > 0) {
+                if (got >= 12 && rd16(r) == id)      /* gecikmis/yanlis id dusur */
+                    ok = dns_parse_a(r, (uint16_t)got, &result);
+            }
+            cpu_hlt();
         }
     }
-    return false;
+    net_udp_close(s);
+    if (out_ip && ok) *out_ip = result;
+    return ok;
 }
 
 extern "C" bool net_http_get(uint32_t ip, uint16_t port, const char* host,

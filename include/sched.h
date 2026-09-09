@@ -22,6 +22,14 @@
 #define SYS_WAIT     16   /* a0=child pid (0=herhangi) -> rax=exit code, -1 yok */
 #define SYS_EXEC     17   /* a0=yol: bu sureci elfla degistir (execve) */
 
+/* ---- UDP soket syscall'lari (int $0x80, 4 arguman: rdi, rsi, rdx, rcx) ---- */
+#define SYS_UDPSOCK     18   /* a0=0               -> rax=fd veya -1 */
+#define SYS_UDPBIND     19   /* a0=fd a1=port      -> 0 veya -1 (0=otomatik) */
+#define SYS_UDPSENDTO   20   /* a0=fd a1=ip a2=port|(len<<16) a3=data -> bayt veya -1 */
+#define SYS_UDPWAIT     21   /* a0=fd a1=tick(10ms) -> 1 veri var / 0 zaman asimi */
+#define SYS_UDPRECVFROM 22   /* a0=fd a1=out a2=cap a3=&{ip4,port2} (0=meta yok) -> bayt */
+#define SYS_UDPCLOSE    23   /* a0=fd              -> 0 veya -1 */
+
 extern "C" {
 
 void   sched_init(void);

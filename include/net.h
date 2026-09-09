@@ -40,4 +40,14 @@ uint32_t net_tcp_recv_some(int s, uint8_t* out, uint32_t cap, uint32_t ticks); /
 bool     net_frag_selftest(void);                                /* IPv4 parca birlestirme testi */
 bool     net_frag_send_selftest(void);                           /* IPv4 gonderim parcalama testi */
 
+/* --- UDP (RFC 768) --- fd tabanli soketler; datagram kuyrugu per soket --- */
+int      net_udp_socket(void);                                   /* yeni bos UDP soket (fd) veya -1 */
+bool     net_udp_bind(int s, uint16_t port);                     /* yerel portu bagla (0=otomatik) */
+int      net_udp_send_to(int s, uint32_t dst, uint16_t dport,    /* datagram gonder (bayt veya -1) */
+                         const uint8_t* data, uint16_t len);
+bool     net_udp_wait(int s, uint32_t ticks);                    /* kuyrukta veri veya zaman asimi */
+int      net_udp_recv_from(int s, uint8_t* out, uint32_t cap,    /* kuyruktan datagram (0=yok) */
+                           uint32_t* src_ip, uint16_t* src_port);
+bool     net_udp_close(int s);                                   /* soketi kapat */
+
 }
