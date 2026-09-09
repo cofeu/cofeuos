@@ -70,6 +70,12 @@ user/udp_dns.o: user/udp_dns.c
 user/udp_dns.elf: user/udp_dns.o user/cofeu_note.o
 	$(CC) $(USERFLAGS) -o $@ $< user/cofeu_note.o
 
+user/tcp_http.o: user/tcp_http.c
+	$(CC) $(USERFLAGS) -c -o $@ $<
+
+user/tcp_http.elf: user/tcp_http.o user/cofeu_note.o
+	$(CC) $(USERFLAGS) -o $@ $< user/cofeu_note.o
+
 kernel/sched.o: kernel/sched.cpp user/user_demo.elf
 	$(CXX) $(CXXFLAGS) -DUSER_ENTRY_ADDR=$$(readelf -h user/user_demo.elf | grep 'Entry point' | sed -n 's/.*\(0x[0-9a-fA-F]*\).*/\1/p') -c -o $@ $<
 
@@ -86,14 +92,15 @@ kernel.bin: kernel.elf
 	    exit 1; \
 	fi
 
-disk.img: boot/boot.bin kernel.bin user/user_demo.elf user/user2.elf user/udp_dns.elf tools/mkfs.py
+disk.img: boot/boot.bin kernel.bin user/user_demo.elf user/user2.elf user/udp_dns.elf user/tcp_http.elf tools/mkfs.py
 	truncate -s $$((67584 * 512)) $@
 	dd if=boot/boot.bin of=$@ conv=notrunc status=none
 	dd if=kernel.bin of=$@ bs=512 seek=1 conv=notrunc status=none
 	python3 tools/mkfs.py $@ \
 	    user/user_demo.elf:/sys/basic.cexe \
 	    user/user2.elf:/sys/hello.cexe \
-	    user/udp_dns.elf:/sys/udp_dns.cexe
+	    user/udp_dns.elf:/sys/udp_dns.cexe \
+	    user/tcp_http.elf:/sys/tcp_http.cexe
 
 QEMU_NET = -netdev user,id=n0 -device rtl8139,netdev=n0
 
@@ -123,4 +130,5 @@ run-iso: iso disk.img
 clean:
 	rm -f kernel.elf kernel.bin disk.img boot/boot.bin cofeuos.iso
 	rm -f kernel/*.o user/user_demo.o user/user_demo.elf user/user_demo.bin user/user2.o user/user2.elf user/cofeu_note.o
+	rm -f user/udp_dns.o user/udp_dns.elf user/tcp_http.o user/tcp_http.elf
 	rm -rf iso_root

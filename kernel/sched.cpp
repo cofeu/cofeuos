@@ -147,6 +147,21 @@ bool copy_user_path(uint64_t src, char* out, int maxlen) {
     return false;                         /* sonlandirilmamis */
 }
 
+/* Engelleyici ag syscall'lari icin sinirli sti penceresi: gercek IRQ'lar
+   (timer -> nic_poll_all + net_tcp_poll_all) beklerken calisir; ctx henuz
+   sched'e verilmedigi icin bayrak geri alinir ve syscall devam eder. */
+static uint64_t rflags_get(void) {
+    uint64_t fl; asm volatile("pushfq; pop %0" : "=r"(fl)); return fl;
+}
+static void rflags_set(uint64_t fl) {
+    asm volatile("push %0; popfq" :: "r"(fl) : "cc", "memory");
+}
+struct IntrLatch {
+    uint64_t fl;
+    IntrLatch() : fl(rflags_get()) { asm volatile("sti"); }
+    ~IntrLatch() { rflags_set(fl); }
+};
+
 /* gomulu kullanici imajini bir kez PMM'e kopyala; tum prosesler paylasir */
 void load_image(void) {
     uint64_t start = (uint64_t)_binary_user_user_demo_bin_start;
@@ -802,6 +817,63 @@ extern "C" uint64_t syscall_handle(uint64_t ctx) {
     case SYS_UDPCLOSE:
         r[OFF_RAX] = net_udp_close((int)a0) ? 0 : (uint64_t)-1;
         break;
+    case SYS_TCPSOCK:
+        r[OFF_RAX] = (uint64_t)net_socket();
+        break;
+    case SYS_TCPLISTEN:
+        r[OFF_RAX] = net_tcp_listen((int)a0, (uint16_t)a1) ? 0 : (uint64_t)-1;
+        break;
+    case SYS_TCPPENDING:
+        r[OFF_RAX] = net_tcp_pending((int)a0);
+        break;
+    case SYS_TCPCONNECT: {
+        IntrLatch il;
+        bool ok = net_tcp_connect((int)a0, (uint32_t)a1, (uint16_t)a2);
+        r[OFF_RAX] = ok ? 0 : (uint64_t)-1;
+        break;
+    }
+    case SYS_TCPACCEPT: {
+        IntrLatch il;
+        int c = net_tcp_accept((int)a0, (uint32_t)a1);
+        r[OFF_RAX] = (c >= 0) ? (uint64_t)c : (uint64_t)-1;
+        break;
+    }
+    case SYS_TCPSEND: {
+        int len = (a2 > 1500) ? 1500 : (int)a2;
+        if (len < 0 || !uaddr_ok(a1, len)) { r[OFF_RAX] = (uint64_t)-1; break; }
+        IntrLatch il;
+        bool ok = net_tcp_send((int)a0, (const uint8_t*)a1, (uint16_t)len);
+        r[OFF_RAX] = ok ? (uint64_t)len : (uint64_t)-1;
+        break;
+    }
+    case SYS_TCPWAIT: {
+        IntrLatch il;
+        net_tcp_wait((int)a0, (uint32_t)a1);
+        bool any = net_tcp_done((int)a0) || net_tcp_err((int)a0) ||
+                   net_tcp_pending((int)a0) > 0;
+        r[OFF_RAX] = any ? 1 : 0;
+        break;
+    }
+    case SYS_TCPRECV: {
+        uint64_t a3 = r[OFF_RCX];
+        if (a2 > 4096 || !uaddr_ok(a1, a2)) { r[OFF_RAX] = (uint64_t)-1; break; }
+        IntrLatch il;
+        uint32_t n = net_tcp_recv_some((int)a0, (uint8_t*)a1, (uint32_t)a2, (uint32_t)a3);
+        if (n == 0) {
+            if (net_tcp_err((int)a0))  r[OFF_RAX] = (uint64_t)-1;
+            else if (net_tcp_done((int)a0)) r[OFF_RAX] = (uint64_t)-2;
+            else r[OFF_RAX] = 0;
+        } else {
+            r[OFF_RAX] = (uint64_t)n;
+        }
+        break;
+    }
+    case SYS_TCPCLOSE: {
+        IntrLatch il;
+        net_tcp_close((int)a0);
+        r[OFF_RAX] = 0;
+        break;
+    }
     default:
         r[OFF_RAX] = (uint64_t)-1;
         break;

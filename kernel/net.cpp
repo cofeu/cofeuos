@@ -616,6 +616,7 @@ struct TxSlot {
 
 struct Tcb {
     int         used;        /* soket bos mu */
+    bool        poll_busy;   /* bu tikte zaten poll isleniyor (IRQ/loop reentrancy) */
     uint8_t     st;          /* 0 KAPALI,1 SYNSENT,2 ESTAB,3 FINW1,4 FINW2,
                                 5 CLOSEW,6 LASTACK,7 TIMEW,8 LISTEN,9 SYNRECV */
     int         lfd;         /* LISTEN ana soket (kabul edilen cocusu icin) */
@@ -758,6 +759,17 @@ static int ts_pick(Tcb& t) {
 static void tcp_abort(Tcb& t) {
     t.err = true; t.done = true; t.ok = false;
     t.used = 0; t.st = 0; t.st_v = 0;
+}
+
+/* IRQ (timer tick) ve engelleyici dongu tcp_poll'u ayni sokette icine icine girebilir
+   (dongu tcp_poll calisirken timer IRQ tetiklenir). poll_busy bayragi yeniden giris kenarini
+   sekar: IRQ altinda zaten islenen soket bu tikte atlanir. */
+static void tcp_poll(Tcb& t);   /* asagida tanimli */
+static void tcp_poll_guarded(Tcb& t) {
+    if (!t.used || t.poll_busy) return;
+    t.poll_busy = true;
+    tcp_poll(t);
+    t.poll_busy = false;
 }
 
 /* ICMP destination-unreachable notunu eslesen TCP sokete uygula. */
@@ -1271,6 +1283,7 @@ extern "C" bool net_frag_send_selftest(void) {
 static void sock_reset(int s) {
     Tcb& t = conns[s];
     t.used = 1; t.st = 0; t.st_v = 0;
+    t.poll_busy = false;
     t.lfd = -1;
     t.ok = t.done = t.err = false;
     t.fin_tx = t.fin_rx = false;
@@ -1306,7 +1319,7 @@ static bool sock_ok(int s, uint32_t ticks) {
     if (s < 0 || s >= TCP_SOCKS || !conns[s].used) return false;
     Tcb& t = conns[s];
     uint64_t dd = timer_get_ticks() + ticks;
-    while (timer_get_ticks() < dd && !t.done && !t.err && !sys_intr_pending()) { sys_intr_poll(); tcp_poll(t); cpu_hlt(); }
+    while (timer_get_ticks() < dd && !t.done && !t.err && !sys_intr_pending()) { sys_intr_poll(); tcp_poll_guarded(t); cpu_hlt(); }
     return true;
 }
 
@@ -1324,7 +1337,7 @@ extern "C" bool net_tcp_connect(int s, uint32_t ip, uint16_t port) {
     for (int r = 0; r < 5 && !t.done; r++) {
         tcp_emit(t, t.iss, TCP_FLAG_SYN, NULL, 0, true, false);
         uint64_t dd = timer_get_ticks() + 50;      /* 500ms */
-        while (!t.done && timer_get_ticks() < dd && !sys_intr_pending()) { sys_intr_poll(); tcp_poll(t); cpu_hlt(); }
+        while (!t.done && timer_get_ticks() < dd && !sys_intr_pending()) { sys_intr_poll(); tcp_poll_guarded(t); cpu_hlt(); }
         if (!t.done) continue;
     }
     if (!t.ok) { t.used = 0; t.st = 0; t.st_v = 0; return false; }
@@ -1389,13 +1402,13 @@ extern "C" bool net_tcp_err(int s) {
 
 extern "C" void net_tcp_poll(int s) {
     if (s < 0 || s >= TCP_SOCKS) return;
-    if (conns[s].used) tcp_poll(conns[s]);
+    if (conns[s].used) tcp_poll_guarded(conns[s]);
 }
 
 /* tum soketleri zamanlayici tarafiyla calistir (accept/recv disi). */
 extern "C" void net_tcp_poll_all(void) {
     for (int i = 0; i < TCP_SOCKS; i++)
-        if (conns[i].used) tcp_poll(conns[i]);
+        if (conns[i].used) tcp_poll_guarded(conns[i]);
 }
 
 extern "C" uint32_t net_tcp_pending(int s) {
@@ -1446,7 +1459,7 @@ extern "C" uint32_t net_tcp_recv_some(int s, uint8_t* out, uint32_t cap, uint32_
     if (s < 0 || s >= TCP_SOCKS) return 0;
     Tcb& t = conns[s];
     uint64_t dd = timer_get_ticks() + ticks;
-    while (timer_get_ticks() < dd && t.rlen == 0 && !t.err && !t.done && !sys_intr_pending()) { sys_intr_poll(); tcp_poll(t); cpu_hlt(); }
+    while (timer_get_ticks() < dd && t.rlen == 0 && !t.err && !t.done && !sys_intr_pending()) { sys_intr_poll(); tcp_poll_guarded(t); cpu_hlt(); }
     return net_tcp_recv(s, out, cap);
 }
 

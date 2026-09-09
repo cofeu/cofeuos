@@ -2,6 +2,7 @@
 #include "x86.h"
 #include "sched.h"
 #include "nic.h"
+#include "net.h"
 
 namespace {
 
@@ -97,6 +98,7 @@ extern "C" uint64_t isr_dispatch(uint64_t vec, uint64_t err, uint64_t ctx) {
         case 0x20:
             timer_irq();
             nic_poll_all();          /* ag paketleri zamanlayiciyla da islenir */
+            net_tcp_poll_all();      /* TCP retrans/RTO/FIN teardown arka planda */
             pic_send_eoi(0);
             return sched_tick(ctx);
         case 0x21:

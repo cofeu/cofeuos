@@ -11,3 +11,4 @@ user/user_io.elf
 user/user_io.c
 __pycache__/
 *.o
+user/tcp_http.elf

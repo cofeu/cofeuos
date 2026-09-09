@@ -30,6 +30,20 @@
 #define SYS_UDPRECVFROM 22   /* a0=fd a1=out a2=cap a3=&{ip4,port2} (0=meta yok) -> bayt */
 #define SYS_UDPCLOSE    23   /* a0=fd              -> 0 veya -1 */
 
+/* ---- TCP soket syscall'lari (int $0x80, 4 arguman) ----
+   Engelleyici olanlar (connect/send/accept/recv/wait/close) cekirdekteki
+   islem sirasinda kisa sti penceresi acar; task gecerliyse syscall ctx
+   kaydedilip sonra devam eder. */
+#define SYS_TCPSOCK     24   /* a0=0                   -> rax=fd veya -1 */
+#define SYS_TCPCONNECT  25   /* a0=fd a1=ip a2=port    -> 0 veya -1 (el sikismasi bekler) */
+#define SYS_TCPLISTEN   26   /* a0=fd a1=port          -> 0 veya -1 */
+#define SYS_TCPACCEPT   27   /* a0=lfd a1=tick(10ms,0=sonsuz) -> cfd veya -1 */
+#define SYS_TCPSEND     28   /* a0=fd a1=veri a2=len   -> len veya -1 (pencere bekler) */
+#define SYS_TCPWAIT     29   /* a0=fd a1=tick          -> 1 veri/hata/kapanis / 0 zaman asimi */
+#define SYS_TCPPENDING  30   /* a0=fd                  -> rxr'de bekleyen bayt */
+#define SYS_TCPRECV     31   /* a0=fd a1=out a2=cap a3=tick -> bayt / -1 hata / -2 kapanis */
+#define SYS_TCPCLOSE    32   /* a0=fd                  -> 0 veya -1 (FIN bekler) */
+
 extern "C" {
 
 void   sched_init(void);
