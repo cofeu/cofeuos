@@ -41,6 +41,7 @@ bool     net_frag_selftest(void);                                /* IPv4 parca b
 bool     net_frag_send_selftest(void);                           /* IPv4 gonderim parcalama testi */
 bool     net_rx_harden_selftest(void);                           /* L3/L4 checksum + IP option reddi */
 bool     net_fast_recovery_selftest(void);                       /* fast recovery + limited transmit */
+bool     net_tcp_ext_selftest(void);                             /* WS/TS + Nagle + keepalive */
 
 /* --- UDP (RFC 768) --- fd tabanli soketler; datagram kuyrugu per soket --- */
 int      net_udp_socket(void);                                   /* yeni bos UDP soket (fd) veya -1 */
