@@ -38,8 +38,8 @@ uint64_t exception_crash(uint64_t vec, uint64_t err, uint64_t ctx) {
     uint64_t uip = ((r[18] & 3) == 3) ? r[17] : 0;   /* cs ve rip (user) */
     uint64_t cr2 = 0;
     if (vec == 14) asm volatile("mov %%cr2, %0" : "=r"(cr2));
-    kslog("EXCEPTION %llu (%s), err=0x%llx uip=0x%llx cr2=0x%llx cs=0x%llx\n",
-          vec, vec < 32 ? names[vec] : "?", err, uip, cr2, r[18]);
+    kslog("EXCEPTION %llu (%s), err=0x%llx uip=0x%llx cr2=0x%llx cs=0x%llx rip=0x%llx fl=0x%llx\n",
+          vec, vec < 32 ? names[vec] : "?", err, uip, cr2, r[18], r[17], r[19]);
     kprintf("\n## EXCEPTION: %s (vec=%d err=0x%x%s)\n",
             vec < 32 ? names[vec] : "?", (int)vec, (uint32_t)err,
             uip ? " [user]" : "");

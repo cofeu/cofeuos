@@ -42,3 +42,5 @@ extern "C" bool mmio_map_device(uint32_t base_phys, uint32_t size_bytes) {
 }
 
 extern "C" uint64_t mmio_shared_pd(void) { return dev_pd; }
+
+extern "C" uint64_t mmio_boot_pml4(void) { return BOOT_PML4; }

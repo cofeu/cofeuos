@@ -589,9 +589,12 @@ extern "C" uint64_t sched_reschedule(uint64_t ctx) {
 
     Process* next = pick_ready(run_again ? self : NULL);
     if (!next) {
-        /* uyuyan/zombi kimse yok; kernel'e don (kernel kimlik haritasi her
-           proseste mevcut oldugundan CR3 degismeden calisabilir) */
+        /* uyuyan/zombi kimse yok; kernel'e don. Ayrica kernel mode'a INRILIRKEN
+           CR3 duzelt: sureci reapledikten sonra eski (freed) pml4 aktif kalirsa
+           kernel heap yazimlari freed+geri-donusturulmus tablolardan gecer ve
+           page fault uretir (3. exec'te gozlemlenen cr2=0x35e000 #PF). */
         cur = NULL; cur_idx = -1;
+        write_cr3(mmio_boot_pml4());
         if (kernel_ctx_valid) return kernel_ctx;
         return ctx;
     }
