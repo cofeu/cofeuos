@@ -39,6 +39,7 @@ int      net_tcp_accept(int s, uint32_t ticks);                  /* kabul edilen
 uint32_t net_tcp_recv_some(int s, uint8_t* out, uint32_t cap, uint32_t ticks); /* veri veya zaman asimi */
 bool     net_frag_selftest(void);                                /* IPv4 parca birlestirme testi */
 bool     net_frag_send_selftest(void);                           /* IPv4 gonderim parcalama testi */
+bool     net_rx_harden_selftest(void);                           /* L3/L4 checksum + IP option reddi */
 
 /* --- UDP (RFC 768) --- fd tabanli soketler; datagram kuyrugu per soket --- */
 int      net_udp_socket(void);                                   /* yeni bos UDP soket (fd) veya -1 */

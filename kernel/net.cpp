@@ -232,6 +232,7 @@ void handle_icmp(const uint8_t* ip, uint16_t len, const uint8_t* eth_src) {
     if (ihl < 20 || len < ihl + 8) return;
     const uint8_t* icmp = ip + ihl;
     uint16_t iclen = (uint16_t)(len - ihl);
+    if (ip_checksum(icmp, iclen) != 0) return;         /* hatali ICMP checksum: dusur */
 
     if (icmp[0] == 8 && icmp[1] == 0) {               /* echo istek -> yanit */
         uint8_t resp[512];
@@ -410,6 +411,10 @@ void handle_udp(const uint8_t* ip, uint16_t len, const uint8_t* eth_src) {
     uint16_t dport = rd16(u + 2);
     uint16_t ulen = rd16(u + 4);
     if (ulen < 8 || ulen > len - ihl) ulen = (uint16_t)(len - ihl);
+
+    if (rd16(u + 6) != 0 &&                           /* UDP checksum (IPv4'te 0 = yok) */
+        udp_checksum(rd32(ip + 12), rd32(ip + 16), u, ulen) != 0)   /* alici degismezci: gecerli pakette 0 */
+        return;
 
     if (eth_src) arp_learn(rd32(ip + 12), eth_src);       /* gondereni komsu olarak ogren */
 
@@ -964,6 +969,9 @@ void handle_tcp(const uint8_t* ip, uint16_t iplen, const uint8_t* eth_src) {
     uint16_t src_port = rd16(tt);
     uint16_t dst_port = rd16(tt + 2);
 
+    uint16_t tlen = (uint16_t)(iplen - ihl);
+    if (tcp_checksum(src_ip, rd32(ip + 16), tt, tlen) != 0) return;  /* alici degismezci: gecerli TCP'de 0 */
+
     /* paketin bagli oldugu soketi bul: once aktif (ESTAB/kapanis/el sikismasi) 4'lu eslesme,
        bulunamazsa LISTEN port eslesmesi. */
     int s = -1;
@@ -1158,7 +1166,35 @@ static void ip_dispatch(const uint8_t* ip, uint16_t iplen, const uint8_t* eth_sr
     else if (ip[9] == 6) handle_tcp(ip, iplen, eth_src);
 }
 
+/* IP secenek listesini yapi olarak yurur; bozuk listeyi ve LSRR/SSRR
+   (kaynak rotasi) tasiyan paketleri reddeder. EOL/NOP sonrası biten
+   secenekleri kabul eder, diger secenekleri (RR/TS/...) yok sayar. */
+static bool ip_opts_ok(const uint8_t* ip, int ihl) {
+    int o = 20;
+    while (o < ihl) {
+        uint8_t t = ip[o];
+        if (t == 0) return true;                     /* EOOL */
+        if (t == 1) { o++; continue; }               /* NOP */
+        if (o + 1 >= ihl || ip[o + 1] < 2 || o + ip[o + 1] > ihl) return false;
+        if (t == 0x83 || t == 0x89) return false;    /* LSRR / SSRR */
+        o += ip[o + 1];
+    }
+    return true;
+}
+
 void handle_ipv4(const uint8_t* ip, uint16_t iplen, const uint8_t* eth_src) {
+    /* ---- L3 dogrulama (RX hardening) ----
+       Sadece IPv4; IHL ve toplam uzunluk tutarli; IP basligi checksum'u sag; 
+       TTL=0 yol boyu tukenmis sayilir; malformed veya kaynak-rotali (LSRR/SSRR)
+       secenekler sessizce dusurulur. Hatali paketler ust uygulamaya ulasmaz. */
+    if (iplen < 20) return;
+    if ((ip[0] >> 4) != 4) return;
+    uint16_t ihl = (uint16_t)((ip[0] & 0x0F) * 4u);
+    if (ihl < 20 || iplen < ihl) return;
+    if (ip[8] == 0) return;
+    if (ip_checksum(ip, ihl) != 0) return;
+    if (ihl > 20 && !ip_opts_ok(ip, ihl)) return;
+
     uint16_t frag = rd16(ip + 6);
     bool mf = (frag & 0x2000) != 0;
     uint32_t off = (uint32_t)(frag & 0x1FFF) * 8u;
@@ -1167,8 +1203,6 @@ void handle_ipv4(const uint8_t* ip, uint16_t iplen, const uint8_t* eth_src) {
     uint64_t now = timer_get_ticks();
     if (now >= ipf_expire) { ipf_expire = now + 200; for (int i = 0; i < 2; i++) ipf_clear(i); }
 
-    uint16_t ihl = (uint16_t)((ip[0] & 0x0F) * 4u);
-    if (ihl < 20 || iplen <= ihl) return;
     uint16_t pl = (uint16_t)(iplen - ihl);
     if ((uint32_t)off + pl > 65535u - 20u) return;
 
@@ -1187,6 +1221,7 @@ void handle_ipv4(const uint8_t* ip, uint16_t iplen, const uint8_t* eth_src) {
     if (off == 0) {
         F.used = true; F.src = src; F.id = id; F.proto = ip[9]; F.got = 0; F.tot = 0;
         memcpy(ipf_buf[s], ip, 20);
+        ipf_buf[s][0] = 0x45;                  /* IHL=20: secenekler parcaciklarda tasinmayabilir */
     }
     memcpy(pb + off, ip + ihl, pl);
     uint32_t end = off + (uint32_t)pl;
@@ -1197,6 +1232,8 @@ void handle_ipv4(const uint8_t* ip, uint16_t iplen, const uint8_t* eth_src) {
     if (F.tot && F.got >= F.tot) {
         wr16(ipf_buf[s] + 2, (uint16_t)(20 + F.tot));
         wr16(ipf_buf[s] + 6, 0);
+        wr16(ipf_buf[s] + 10, 0);                          /* alan once bosalt */
+        wr16(ipf_buf[s] + 10, ip_checksum(ipf_buf[s], 20));  /* toplam uzunluk degisti */
         ip_dispatch(ipf_buf[s], (uint16_t)(20 + F.tot), eth_src);
         ipf_clear(s);
     }
@@ -1242,6 +1279,67 @@ extern "C" bool net_frag_selftest(void) {
     handle_ipv4(f0, sizeof(f0), NULL);
     handle_ipv4(f1, sizeof(f1), NULL);
     return stat_tx == t0 + 1;
+}
+
+/*
+ * RX hardening testi: gecerli ICMP echo yanitlanmali; bozuk IP checksum,
+ * bozuk ICMP checksum ve LSRR (kaynak rotasi) secenekli paketler sessizce
+ * dusurulmeli (stat_tx artirmadan).
+ */
+extern "C" bool net_rx_harden_selftest(void) {
+    if (!net_active()) return false;
+    uint32_t gw = net_get_gw();
+    uint8_t p[60];
+
+    auto feed = [&](uint8_t* q, int iplen) { handle_ipv4(q, (uint16_t)iplen, NULL); };
+    auto mk_ack = [&](bool good_ip, bool icmp_ok, uint8_t otype, bool valid_opt) {
+        memset(p, 0, sizeof(p));
+        uint16_t ihl = 20;
+        if (otype) {
+            ihl = 28;
+            p[0] = 0x47;                          /* IHL=7 => secenek bolgesi */
+            p[20] = otype;
+            if (valid_opt && otype >= 2) { p[21] = 7; p[22] = 4; }
+            else p[21] = 0;                       /* bozuk uzunluk */
+        } else {
+            p[0] = 0x45;
+        }
+        p[8] = 64; p[9] = 1;
+        wr16(p + 2, ihl + 8);
+        wr32(p + 12, gw);
+        wr32(p + 16, our_ip);
+        p[ihl] = 8;                               /* echo istek */
+        p[ihl + 1] = 0;
+        p[ihl + 2] = p[ihl + 3] = 0;
+        wr16(p + ihl + 4, 0x1234);
+        wr16(p + ihl + 6, 1);
+        wr16(p + ihl + 2, ip_checksum(p + ihl, 8));
+        if (!icmp_ok) p[ihl + 2] ^= 0xFF;
+        wr16(p + 10, 0);
+        wr16(p + 10, ip_checksum(p, (int)ihl));
+        if (!good_ip) p[10] ^= 0xFF;
+    };
+
+    uint64_t t0 = stat_tx;
+    mk_ack(true, true, 0, true);        /* gecerli echo -> yanitla */
+    feed(p, 28);
+    if (stat_tx != t0 + 1) return false;
+
+    mk_ack(false, true, 0, true);       /* bozuk IP checksum -> dusur */
+    feed(p, 28);
+    if (stat_tx != t0 + 1) return false;
+
+    mk_ack(true, false, 0, true);       /* bozuk ICMP checksum -> dusur */
+    feed(p, 28);
+    if (stat_tx != t0 + 1) return false;
+
+    mk_ack(true, true, 0x83, true);     /* LSRR secenegi -> dusur */
+    feed(p, 36);
+    if (stat_tx != t0 + 1) return false;
+
+    mk_ack(true, true, 0x07, true);     /* RR secenegi (zararsiz) -> yanitla */
+    feed(p, 36);
+    return stat_tx == t0 + 2;           /* yalniz RR'li paket ikinci yaniti uretir */
 }
 
 /*
