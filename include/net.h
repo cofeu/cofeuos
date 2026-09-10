@@ -9,7 +9,10 @@ void     net_init(const uint8_t mac[6], uint32_t ip, uint32_t mask, uint32_t gw)
 void     net_handle_eth(const uint8_t* frame, uint16_t len);  /* rtl8139'dan gelir */
 bool     net_ping(uint32_t ip);                               /* ping gonder, sonuc don */
 bool     net_dhcp(void);                                      /* DHCP ile IP al (engelleyici) */
-bool     net_dns_resolve(const char* name, uint32_t* out_ip); /* A kaydi coz (engelleyici) */
+bool     net_dhcp_renew(void);                                /* kirayi yenile (REQUEST ciaddr) */
+uint32_t net_dhcp_lease(void);                                /* kalan kira (sn), yoksa 0 */
+bool     net_dns_resolve(const char* name, uint32_t* out_ip); /* A kaydi coz (onbellek + CNAME) */
+uint32_t net_dns_cache_hits(void);                            /* onbellek isabet sayaci */
 bool     net_http_get(uint32_t ip, uint16_t port, const char* host,
                       const char* path, char* out, int out_cap);
 uint32_t net_get_dns(void);
@@ -36,12 +39,16 @@ bool     net_tcp_err(int s);                                     /* RST / hata *
 uint32_t net_tcp_pending(int s);                                 /* rxr'de bekleyen bayt */
 bool     net_tcp_listen(int s, uint16_t port);                   /* pasif acilis (LISTEN) */
 int      net_tcp_accept(int s, uint32_t ticks);                  /* kabul edilen soket (fd) veya -1 */
+int      net_tcp_accept_nb(int s);                               /* beklemeden accept (0 = yok) */
 uint32_t net_tcp_recv_some(int s, uint8_t* out, uint32_t cap, uint32_t ticks); /* veri veya zaman asimi */
 bool     net_frag_selftest(void);                                /* IPv4 parca birlestirme testi */
 bool     net_frag_send_selftest(void);                           /* IPv4 gonderim parcalama testi */
 bool     net_rx_harden_selftest(void);                           /* L3/L4 checksum + IP option reddi */
 bool     net_fast_recovery_selftest(void);                       /* fast recovery + limited transmit */
 bool     net_tcp_ext_selftest(void);                             /* WS/TS + Nagle + keepalive */
+bool     net_dns_cache_selftest(void);                           /* DNS CNAME + onbellek */
+bool     net_dhcp_ext_selftest(void);                            /* DHCP kira/NAK/yenileme */
+bool     net_aux_selftest(void);                                 /* ARP yaslandirma + ICMP */
 
 /* --- UDP (RFC 768) --- fd tabanli soketler; datagram kuyrugu per soket --- */
 int      net_udp_socket(void);                                   /* yeni bos UDP soket (fd) veya -1 */

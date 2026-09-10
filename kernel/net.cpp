@@ -22,8 +22,11 @@ struct ArpEntry {
     uint32_t ip;
     uint8_t  mac[6];
     bool     valid;
+    uint64_t at;                    /* son kullanim ani (tick): yaslandirma */
 };
 ArpEntry arp_cache[8];
+
+constexpr uint64_t ARP_AGE = 600;   /* komsu girisinin yaslanma esigi (tick) */
 
 volatile bool    arp_waiting = false;
 volatile bool    arp_done    = false;
@@ -40,6 +43,18 @@ volatile uint32_t ping_reply_src = 0;
 struct IcmpUr { volatile bool pend; volatile bool tcp;
                 volatile uint32_t ip; volatile uint16_t sport, dport; };
 IcmpUr icmp_ur = { false, false, 0, 0, 0 };
+
+/* ---- ICMP redirect (RFC 792/1122): hedefe daha iyi yol onerisi ---- */
+struct RedirEntry {
+    bool     used;
+    uint32_t dst;
+    uint32_t nexthop;
+    uint64_t until;
+};
+RedirEntry redir = { false, 0, 0, 0 };
+constexpr uint64_t REDIR_TTL = 600;   /* yonlendirme omru (tick) */
+
+static void net_aux_tick(void);       /* ARP yaslandirma + kira yenileme + parca zaman asimi */
 
 /* ---- big-endian yardimci ------ */
 uint16_t rd16(const uint8_t* p) { return (uint16_t)((p[0] << 8) | p[1]); }
@@ -91,9 +106,11 @@ void eth_send(const uint8_t* dmac, uint16_t type, const uint8_t* payload, uint16
 /* ---- ARP ---- */
 void arp_learn(uint32_t ip, const uint8_t* mac) {
     if (ip == 0xFFFFFFFFu) return;
+    uint64_t now = timer_get_ticks();
     for (int i = 0; i < 8; i++) {
         if (arp_cache[i].valid && arp_cache[i].ip == ip) {
             memcpy(arp_cache[i].mac, mac, 6);
+            arp_cache[i].at = now;
             return;
         }
     }
@@ -102,8 +119,18 @@ void arp_learn(uint32_t ip, const uint8_t* mac) {
             arp_cache[i].valid = true;
             arp_cache[i].ip = ip;
             memcpy(arp_cache[i].mac, mac, 6);
+            arp_cache[i].at = now;
             return;
         }
+}
+
+/* ARP onbellegi yaslandir (net_aux_tick): suresi dolan komsu atilir;
+   bir sonraki gonderimde yeniden cozuulur. */
+static void arp_aging_poll(void) {
+    uint64_t now = timer_get_ticks();
+    for (int i = 0; i < 8; i++)
+        if (arp_cache[i].valid && now - arp_cache[i].at >= ARP_AGE)
+            arp_cache[i].valid = false;
 }
 
 void arp_send(uint16_t oper, uint32_t tip, const uint8_t* dmac) {
@@ -124,6 +151,7 @@ bool arp_resolve(uint32_t ip, uint8_t* mac) {
     for (int i = 0; i < 8; i++)
         if (arp_cache[i].valid && arp_cache[i].ip == ip) {
             memcpy(mac, arp_cache[i].mac, 6);
+            arp_cache[i].at = timer_get_ticks();
             return true;
         }
 
@@ -179,8 +207,12 @@ void ip_send(uint32_t dst, const uint8_t* dmac, uint8_t proto,
     uint8_t tmpmac[6];
     if (!dmac) {
         uint32_t l2dst = dst;
-        if ((dst & our_mask) != (our_ip & our_mask))   /* dis ag: gateway uzerinden */
+        if ((dst & our_mask) != (our_ip & our_mask)) {   /* dis ag: gateway uzerinden */
             l2dst = gateway;
+            if (redir.used && redir.dst == dst &&
+                timer_get_ticks() < redir.until)        /* ICMP redirect: guncel yol */
+                l2dst = redir.nexthop;
+        }
         if (!arp_resolve(l2dst, tmpmac)) return;
         dmac = tmpmac;
     }
@@ -262,7 +294,35 @@ void handle_icmp(const uint8_t* ip, uint16_t len, const uint8_t* eth_src) {
         icmp_ur.dport = rd16(oip + oihl + 2);
         icmp_ur.tcp = (oip[9] == 6);
         icmp_ur.pend = true;
+    } else if (icmp[0] == 5) {                          /* redirect: hedefe guncel yol */
+        /* yalniz dogrudan komsudan ve on-link nacik olan nexthop kabul (RFC 1122) */
+        if (iclen < 8 + 20 + 8) return;
+        if (our_mask && (rd32(ip + 12) & our_mask) != (our_ip & our_mask)) return;
+        uint32_t ngw = rd32(icmp + 4);
+        if (!ngw || ngw == 0xFFFFFFFFu || ngw == our_ip) return;
+        if (our_mask && (ngw & our_mask) != (our_ip & our_mask)) return;
+        const uint8_t* oip = icmp + 8;
+        uint16_t oihl = (uint16_t)((oip[0] & 0x0F) * 4u);
+        if (oihl < 20 || iclen < 8 + oihl) return;
+        uint32_t dst = rd32(oip + 16);
+        if (!dst || dst == 0xFFFFFFFFu || dst == our_ip) return;
+        redir.used = true;
+        redir.dst = dst;
+        redir.nexthop = ngw;
+        redir.until = timer_get_ticks() + REDIR_TTL;
     }
+}
+
+/* ICMP time-exceeded (RFC 792): parcali veri zamaninda toplanamadi -> kaynak
+   bilgilendirilir (saklanan IP basligi + ilk 8 bayt govde gonderilir). */
+static void icmp_time_exceeded(uint32_t src, const uint8_t* hdr) {
+    uint8_t m[8 + 20 + 8];
+    memset(m, 0, sizeof(m));
+    m[0] = 11; m[1] = 1;                      /* time exceeded, code 1: parca toplama */
+    memcpy(m + 8, hdr, 20);                   /* orijinal IP basligi */
+    memcpy(m + 28, hdr + 20, 8);              /* ilk 8 bayt govde (varsa) */
+    wr16(m + 2, ip_checksum(m, sizeof(m)));
+    ip_send(src, NULL, 1, m, sizeof(m));
 }
 
 /* ---- UDP ---- */
@@ -301,6 +361,19 @@ uint32_t dhcp_offer_router = 0;
 uint32_t dhcp_offer_dns = 0;
 uint32_t dhcp_offer_sid = 0;
 uint32_t dns_server = 0;
+volatile uint32_t dhcp_lease = 0;      /* kira suresi (sn); yoksa 3600 */
+volatile uint64_t dhcp_lease_until = 0;/* kira bitim ani (tick) */
+volatile bool     dhcp_nak = false;    /* son istek NAK ile reddedildi */
+volatile bool     dhcp_renew_pend = false;  /* otomatik yenileme isteginde */
+volatile uint64_t dhcp_renew_at = 0;        /* yenileme tekrar zamani (tick) */
+
+static void dhcp_apply_lease(uint16_t lease_secs) {
+    uint32_t secs = lease_secs ? lease_secs : 3600u;
+    if (secs < 20) secs = 20;                       /* sonsuz-dongu korumasi */
+    dhcp_lease = secs;
+    dhcp_lease_until = timer_get_ticks() + (uint64_t)secs * 100u;
+    dhcp_renew_pend = false;
+}
 
 uint8_t* dhcp_build(uint8_t* b, uint8_t mtype) {
     memset(b, 0, 240);
@@ -308,6 +381,7 @@ uint8_t* dhcp_build(uint8_t* b, uint8_t mtype) {
     wr32(b + 4, dhcp_txid);
     wr16(b + 10, 0x8000);               /* yaniti broadcast iste */
     memcpy(b + 28, our_mac, 6);
+    if (mtype == 3 && our_ip) wr32(b + 12, our_ip);   /* ciaddr: yenileme adresi */
     b[236] = 0x63; b[237] = 0x82; b[238] = 0x53; b[239] = 0x63;  /* sihirli cookie */
     uint8_t* o = b + 240;
     *o++ = 53; *o++ = 1; *o++ = mtype;
@@ -326,6 +400,7 @@ void handle_dhcp(const uint8_t* b, uint16_t avail) {
 
     uint8_t mtype = 0;
     uint32_t mask = 0, router = 0, dns = 0, sid = 0;
+    uint32_t lease = 0;
     if (avail > 300) avail = 300;
     const uint8_t* o = b + 240;
     const uint8_t* end = b + 240 + avail;
@@ -339,6 +414,7 @@ void handle_dhcp(const uint8_t* b, uint16_t avail) {
         else if (c == 1 && ln == 4)   { mask   = rd32(o); }
         else if (c == 3 && ln >= 4)   { router = rd32(o); }
         else if (c == 6 && ln >= 4)   { dns    = rd32(o); }
+        else if (c == 51 && ln == 4)  { lease  = rd32(o); }
         else if (c == 54 && ln == 4)  { sid    = rd32(o); }
         o += ln;
     }
@@ -353,6 +429,11 @@ void handle_dhcp(const uint8_t* b, uint16_t avail) {
         if (mask)   dhcp_offer_mask   = mask;
         if (router) dhcp_offer_router = router;
         if (dns)    dhcp_offer_dns    = dns;
+        dhcp_apply_lease((uint16_t)lease);
+        dhcp_nak = false;
+        dhcp_done = true;
+    } else if (dhcp_phase == 3 && mtype == 6) {       /* NAK: istek reddedildi */
+        dhcp_nak = true;
         dhcp_done = true;
     }
 }
@@ -530,12 +611,51 @@ int dns_qname(uint8_t* out, const char* name) {
 }
 
 void dns_skip_name(const uint8_t* d, int& pos, int limit) {
+    int jumps = 0;
     for (;;) {
         if (pos < 0 || pos >= limit) { pos = -1; return; }
         uint8_t b = d[pos];
-        if (b & 0xC0) { pos += 2; return; }        /* sikistirma isaretcisi */
+        if (b & 0xC0) {                    /* sikistirma isaretcisi */
+            if (++jumps > 12) { pos = -1; return; }
+            pos += 2;
+            return;
+        }
         if (b == 0)   { pos += 1; return; }
         pos += 1 + b;
+    }
+}
+
+/* Adi (yalin/sekil) bozar; sikistirma isaretcilerini takip eder. */
+static int dns_read_name(const uint8_t* d, int pos, int limit, char* out, int cap) {
+    int on = 0;
+    int jumps = 0;
+    int cur = pos;
+    int after = pos;
+    bool jumped = false;
+    for (;;) {
+        if (cur < 0 || cur + 1 > limit) return -1;
+        uint8_t blen = d[cur];
+        if (blen & 0xC0) {                 /* sikistirma isaretcisi: konumu atla, takip et */
+            if (++jumps > 12) return -1;
+            int np = ((int)(blen & 0x3F) << 8) | d[cur + 1];
+            if (cur + 1 >= limit) return -1;
+            if (!jumped) { after = cur + 2; jumped = true; }
+            cur = np;
+            continue;
+        }
+        if (blen == 0) {
+            if (!jumped) after = cur + 1;
+            if (on == 0 && out && cap > 0) out[0] = 0;
+            return after;
+        }
+        if (cur + 1 + (int)blen > limit) return -1;
+        for (int i = 0; i < blen; i++) {
+            if (on >= cap - 1) return -1;
+            out[on++] = (char)d[cur + 1 + i];
+        }
+        if (on >= cap - 1) return -1;
+        out[on++] = '.';
+        cur = cur + 1 + (int)blen;
     }
 }
 
@@ -550,33 +670,87 @@ int dns_query(uint8_t* b, uint16_t qid, const char* name) {
     return 12 + n + 4;
 }
 
-/* DNS yanitindan A kaydini cikar; basarili olursa *out'u doldurup true doner. */
-static bool dns_parse_a(const uint8_t* data, uint16_t len, uint32_t* out) {
-    if (len < 12) return false;
-    if (!(rd16(data + 2) & 0x8000)) return false;        /* yanit (QR) degil */
+/* Yanit cozumleme: A bulunursa 1 (ip+ttl), yalniz CNAME varsa 2 (*cname hedef),
+   hicbiri yoksa 0. TTL cagiranin cache'i doldurabilmesi icin cikarilir. */
+static int dns_parse_ans(const uint8_t* data, uint16_t len, uint32_t* out_ip,
+                         uint32_t* out_ttl, char* cname, int cname_cap) {
+    if (len < 12) return 0;
+    if (!(rd16(data + 2) & 0x8000)) return 0;        /* yanit (QR) degil */
     uint16_t qd = rd16(data + 4);
     uint16_t an = rd16(data + 6);
     int pos = 12;
     int limit = (int)len;
     for (int i = 0; i < qd; i++) {
         dns_skip_name(data, pos, limit);
-        if (pos < 0) return false;
+        if (pos < 0) return 0;
         pos += 4;
     }
+    bool got_cname = false;
     for (int i = 0; i < an; i++) {
         dns_skip_name(data, pos, limit);
-        if (pos < 0) return false;
-        if (pos + 10 > limit) return false;
+        if (pos < 0) return got_cname ? 2 : 0;
+        if (pos + 10 > limit) return got_cname ? 2 : 0;
         uint16_t type  = rd16(data + pos);
         uint16_t rdlen = rd16(data + pos + 8);
+        uint32_t ttl   = rd32(data + pos + 4);
         pos += 10;
         if (type == 1 && rdlen == 4 && pos + 4 <= limit) {   /* A kaydi */
-            if (out) *out = rd32(data + pos);
-            return true;
+            if (out_ip)  *out_ip = rd32(data + pos);
+            if (out_ttl) *out_ttl = ttl;
+            return 1;
+        } else if (type == 5 && rdlen <= (uint32_t)(limit - pos) &&
+                   !got_cname && cname && cname_cap > 0) {   /* CNAME: hedefi cikar */
+            if (dns_read_name(data, pos, limit, cname, cname_cap) >= 0) got_cname = true;
         }
         pos += rdlen;
     }
+    return got_cname ? 2 : 0;
+}
+
+/* ---- DNS onbellegi (RFC 1035 TTL + RFC 2308 negatif yok) ---- */
+enum { DNS_CACHE = 16 };
+struct DnsCacheEntry {
+    bool     valid;
+    char     name[64];
+    uint32_t ip;
+    uint64_t until;                    /* gecerlilik bitimi (tick) */
+};
+DnsCacheEntry dns_cache[DNS_CACHE];
+volatile uint32_t dns_cache_hits = 0;
+
+static bool dns_cache_lookup(const char* name, uint32_t* out_ip) {
+    uint64_t now = timer_get_ticks();
+    for (int i = 0; i < DNS_CACHE; i++) {
+        DnsCacheEntry& e = dns_cache[i];
+        if (!e.valid) continue;
+        if (now >= e.until) { e.valid = false; continue; }
+        if (strcmp(e.name, name) == 0) {
+            if (out_ip) *out_ip = e.ip;
+            dns_cache_hits++;
+            return true;
+        }
+    }
     return false;
+}
+
+static void dns_cache_store(const char* name, uint32_t ip, uint32_t ttl) {
+    uint64_t until = timer_get_ticks() + (uint64_t)ttl * 100u;
+    /* bos/ta molmis yer bul, eksi surelerden once sil */
+    int slot = -1;
+    for (int i = 0; i < DNS_CACHE; i++) {
+        if (!dns_cache[i].valid) { slot = i; break; }
+        if (timer_get_ticks() >= dns_cache[i].until) { slot = i; break; }
+    }
+    if (slot < 0) {                                     /* dolu: LRU benzeri -> en yasli */
+        uint64_t oldest = ~0ull;
+        for (int i = 0; i < DNS_CACHE; i++)
+            if (dns_cache[i].until < oldest) { oldest = dns_cache[i].until; slot = i; }
+    }
+    DnsCacheEntry& e = dns_cache[slot];
+    e.valid = true; e.ip = ip; e.until = until;
+    int i = 0;
+    for (; i < 63 && name[i]; i++) e.name[i] = name[i];
+    e.name[i] = 0;
 }
 
 /* ---- TCP (RFC 793/1122/6298): tam cekirdek, tek aktif baglanti ----
@@ -1263,6 +1437,7 @@ struct IpFrag {
 IpFrag ipfrags[2];
 uint8_t ipf_buf[2][65556];
 uint64_t ipf_expire = 0;
+bool     ipf_armed = false;      /* bekleyen parca var (zaman asimi denetimi etkin) */
 
 static void ipf_clear(int i) {
     ipfrags[i].used = false; ipfrags[i].got = 0; ipfrags[i].tot = 0;
@@ -1309,7 +1484,6 @@ void handle_ipv4(const uint8_t* ip, uint16_t iplen, const uint8_t* eth_src) {
     if (!mf && !off) { ip_dispatch(ip, iplen, eth_src); return; }
 
     uint64_t now = timer_get_ticks();
-    if (now >= ipf_expire) { ipf_expire = now + 200; for (int i = 0; i < 2; i++) ipf_clear(i); }
 
     uint16_t pl = (uint16_t)(iplen - ihl);
     if ((uint32_t)off + pl > 65535u - 20u) return;
@@ -1326,16 +1500,17 @@ void handle_ipv4(const uint8_t* ip, uint16_t iplen, const uint8_t* eth_src) {
 
     IpFrag& F = ipfrags[s];
     uint8_t* pb = ipf_buf[s] + 20;
+    memcpy(ipf_buf[s], ip, 20);            /* her parca IP basligini tasir: zaman asimi iletimi icin sakla */
+    ipf_buf[s][0] = 0x45;                  /* IHL=20: secenekler parcaciklarda tasinmayabilir */
     if (off == 0) {
         F.used = true; F.src = src; F.id = id; F.proto = ip[9]; F.got = 0; F.tot = 0;
-        memcpy(ipf_buf[s], ip, 20);
-        ipf_buf[s][0] = 0x45;                  /* IHL=20: secenekler parcaciklarda tasinmayabilir */
     }
     memcpy(pb + off, ip + ihl, pl);
     uint32_t end = off + (uint32_t)pl;
     if (end > F.got) F.got = (uint16_t)end;
     if (!mf) F.tot = (uint16_t)end;
     ipf_expire = now + 200;
+    ipf_armed = true;
 
     if (F.tot && F.got >= F.tot) {
         wr16(ipf_buf[s] + 2, (uint16_t)(20 + F.tot));
@@ -1345,6 +1520,19 @@ void handle_ipv4(const uint8_t* ip, uint16_t iplen, const uint8_t* eth_src) {
         ip_dispatch(ipf_buf[s], (uint16_t)(20 + F.tot), eth_src);
         ipf_clear(s);
     }
+}
+
+/* Parca toplama zaman asimi (RFC 792): sure dolan yarim kalmis datagram icin
+   kaynak ICMP time-exceeded ile bilgilendirilir. net_aux_tick cagirir. */
+static void frag_expiry_poll(void) {
+    if (!ipf_armed) return;
+    uint64_t now = timer_get_ticks();
+    if (now < ipf_expire) return;
+    for (int i = 0; i < 2; i++)
+        if (ipfrags[i].used)
+            icmp_time_exceeded(ipfrags[i].src, ipf_buf[i]);
+    for (int i = 0; i < 2; i++) ipf_clear(i);
+    ipf_armed = false;
 }
 
 /*
@@ -1676,8 +1864,8 @@ extern "C" bool net_tcp_ext_selftest(void) {
     conns[c].last_rx = timer_get_ticks() - TCP_KA_IDLE - 1;
     net_tcp_poll(c);
     if (!conns[c].used || conns[c].ka_probes != 1 || stat_tx != k0 + 1) { return fail(); }
-    for (int i = 0; i < TCP_KA_CNT; i++) {
-        conns[c].ka_at = timer_get_ticks() - TCP_KA_RATE;
+    for (int i = 0; i < (int)TCP_KA_CNT; i++) {
+        conns[c].ka_at = timer_get_ticks() - (uint64_t)TCP_KA_RATE;
         net_tcp_poll(c);
         if (!conns[c].used) break;
     }
@@ -1719,6 +1907,210 @@ extern "C" bool net_frag_send_selftest(void) {
     if (rd16(f1 + 6) != (1480 / 8))            return false;   /* MF=0, off=185 */
     if (ethsnoop_len[0] > 1514)                return false;
     if (ethsnoop_len[1] > 1514)                return false;
+    return true;
+}
+
+/* DNS: CNAME zinciri cozumleme + onbellegi dogrular (ag gerektirmez). */
+extern "C" bool net_dns_cache_selftest(void) {
+    uint32_t ip = 0, ttl = 0;
+    char cn[64];
+
+    const uint8_t qalias[] = { 5, 'a', 'l', 'i', 'a', 's', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+    const uint8_t qwww[]   = { 3, 'w', 'w', 'w', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+    const int cn_rdata0    = 12 + (int)sizeof(qalias) + 4 + 12;
+
+    uint8_t r[160];
+    memset(r, 0, sizeof(r));
+    wr16(r, 0xBEEF); wr16(r + 2, 0x8180);
+    wr16(r + 4, 1); wr16(r + 6, 2);
+    int pos = 12;
+    memcpy(r + pos, qalias, sizeof(qalias)); pos += (int)sizeof(qalias);
+    wr16(r + pos, 1); wr16(r + pos + 2, 1); pos += 4;
+    wr16(r + pos, 0xC00C);                       /* ad = sorudaki isim */
+    wr16(r + pos + 2, 5); wr16(r + pos + 4, 1); wr32(r + pos + 6, 60);
+    wr16(r + pos + 10, (uint16_t)sizeof(qwww));
+    memcpy(r + pos + 12, qwww, sizeof(qwww));
+    pos += 12 + (int)sizeof(qwww);
+    wr16(r + pos, (uint16_t)(0xC000 | cn_rdata0));
+    wr16(r + pos + 2, 1); wr16(r + pos + 4, 1); wr32(r + pos + 6, 120);
+    wr16(r + pos + 10, 4); wr32(r + pos + 12, 0x01020304);
+    int total = pos + 16;
+    if (dns_parse_ans(r, (uint16_t)total, &ip, &ttl, cn, sizeof(cn)) != 1) return false;
+    if (ip != 0x01020304 || ttl != 120) return false;
+
+    /* yalniz CNAME: hedef adi yalip 2 donmeli (net_dns_resolve hedefe tekrar sorar) */
+    uint8_t r2[160];
+    memset(r2, 0, sizeof(r2));
+    wr16(r2, 0xBEEF + 1); wr16(r2 + 2, 0x8180);
+    wr16(r2 + 4, 1); wr16(r2 + 6, 1);
+    pos = 12;
+    memcpy(r2 + pos, qalias, sizeof(qalias)); pos += (int)sizeof(qalias);
+    wr16(r2 + pos, 1); wr16(r2 + pos + 2, 1); pos += 4;
+    wr16(r2 + pos, 0xC00C);
+    wr16(r2 + pos + 2, 5); wr16(r2 + pos + 4, 1); wr32(r2 + pos + 6, 60);
+    wr16(r2 + pos + 10, (uint16_t)sizeof(qwww));
+    memcpy(r2 + pos + 12, qwww, sizeof(qwww));
+    total = pos + 12 + (int)sizeof(qwww);
+    memset(cn, 0, sizeof(cn));
+    if (dns_parse_ans(r2, (uint16_t)total, &ip, &ttl, cn, sizeof(cn)) != 2) return false;
+    if (strcmp(cn, "www.example.") != 0) return false;
+
+    /* onbellek: yaz, oku, sureyi dusur, kayboldugunu gor */
+    uint32_t hits0 = dns_cache_hits;
+    dns_cache_store("cache.example", 0x05060708, 60);
+    if (!dns_cache_lookup("cache.example", &ip) || ip != 0x05060708) return false;
+    if (dns_cache_hits != hits0 + 1) return false;
+    for (int i = 0; i < DNS_CACHE; i++)
+        if (dns_cache[i].valid && strcmp(dns_cache[i].name, "cache.example") == 0)
+            dns_cache[i].until = 0;
+    if (dns_cache_lookup("cache.example", &ip)) return false;
+    return true;
+}
+
+/* DHCP: kira suresi (opt 51), NAK ve yenileme istegi yapisi dogrular. */
+extern "C" bool net_dhcp_ext_selftest(void) {
+    our_ip = 0x0A00020F; dhcp_txid = 0x12345678;
+
+    /* OFFER */
+    dhcp_phase = 1; dhcp_done = false; dhcp_nak = false;
+    dhcp_offer_ip = dhcp_offer_mask = dhcp_offer_router = dhcp_offer_dns = dhcp_offer_sid = 0;
+    uint8_t b[300];
+    memset(b, 0, sizeof(b));
+    b[0] = 2; b[1] = 1; b[2] = 6;
+    wr32(b + 4, dhcp_txid);
+    wr32(b + 16, 0x0A00020F);
+    wr32(b + 236, 0x63825363);
+    uint8_t* o = b + 240;
+    *o++ = 53; *o++ = 1; *o++ = 2;
+    *o++ = 1; *o++ = 4; wr32(o, 0xFFFFFF00); o += 4;
+    *o++ = 3; *o++ = 4; wr32(o, 0x0A000202); o += 4;
+    *o++ = 6; *o++ = 4; wr32(o, 0x0A000203); o += 4;
+    *o++ = 51; *o++ = 4; wr32(o, 7200); o += 4;
+    *o++ = 54; *o++ = 4; wr32(o, 0x0A000201); o += 4;
+    *o++ = 255;
+    handle_dhcp(b, (uint16_t)(o - b - 240));
+    if (!dhcp_done || dhcp_offer_ip != 0x0A00020F) return false;
+
+    /* ACK -> kira */
+    uint8_t ac[300];
+    memset(ac, 0, sizeof(ac));
+    ac[0] = 2; ac[1] = 1; ac[2] = 6;
+    wr32(ac + 4, dhcp_txid);
+    wr32(ac + 16, 0x0A00020F);
+    wr32(ac + 236, 0x63825363);
+    o = ac + 240;
+    *o++ = 53; *o++ = 1; *o++ = 5;
+    *o++ = 51; *o++ = 4; wr32(o, 7200); o += 4;
+    *o++ = 54; *o++ = 4; wr32(o, 0x0A000201); o += 4;
+    *o++ = 255;
+    dhcp_phase = 3; dhcp_done = false; dhcp_nak = false; dhcp_lease = 0; dhcp_lease_until = 0;
+    handle_dhcp(ac, (uint16_t)(o - ac - 240));
+    if (!dhcp_done || dhcp_nak) return false;
+    if (dhcp_lease != 7200 || !dhcp_lease_until) return false;
+    if (dhcp_lease_until < timer_get_ticks() + 719000u) return false;
+
+    /* NAK -> reddedildi */
+    uint8_t nk[260];
+    memset(nk, 0, sizeof(nk));
+    nk[0] = 2; nk[1] = 1; nk[2] = 6;
+    wr32(nk + 4, dhcp_txid);
+    wr32(nk + 236, 0x63825363);
+    o = nk + 240;
+    *o++ = 53; *o++ = 1; *o++ = 6;
+    *o++ = 54; *o++ = 4; wr32(o, 0x0A000201); o += 4;
+    *o++ = 255;
+    dhcp_phase = 3; dhcp_done = false; dhcp_nak = false;
+    handle_dhcp(nk, (uint16_t)(o - nk - 240));
+    if (!dhcp_done || !dhcp_nak) return false;
+
+    /* REQUEST yapisi: ciaddr=our_ip, mtype 3 */
+    dhcp_offer_ip = 0x0A00020F; dhcp_offer_sid = 0x0A000201;
+    uint8_t rb[272];
+    dhcp_build(rb, 3);
+    if (rd32(rb + 12) != our_ip) return false;
+    if (rb[240] != 53 || rb[241] != 1 || rb[242] != 3) return false;
+
+    dhcp_phase = 0; dhcp_done = false; dhcp_nak = false; dhcp_waiting = false; dhcp_renew_pend = false;
+    return true;
+}
+
+/* ARP yaslandirma + ICMP redirect rotasi + parca zaman asimi (time-exceeded). */
+extern "C" bool net_aux_selftest(void) {
+    if (!net_active()) return false;
+
+    /* 1) ARP yaslandirma */
+    uint8_t m0[6] = { 1, 2, 3, 4, 5, 6 };
+    arp_learn(0xC0000201, m0);
+    bool found = false;
+    for (int i = 0; i < 8; i++)
+        if (arp_cache[i].valid && arp_cache[i].ip == 0xC0000201) {
+            arp_cache[i].at = timer_get_ticks() - ARP_AGE - 1;
+            found = true;
+            break;
+        }
+    if (!found) return false;
+    arp_aging_poll();
+    for (int i = 0; i < 8; i++)
+        if (arp_cache[i].valid && arp_cache[i].ip == 0xC0000201) return false;
+
+    /* 2) ICMP redirect -> hedefe daha iyi yol (10.0.2.5) */
+    uint32_t ngw = 0x0A000205;
+    redir.used = false;
+    uint8_t rp[20 + 40];
+    memset(rp, 0, sizeof(rp));
+    rp[0] = 0x45; wr16(rp + 2, (uint16_t)(20 + 40)); rp[8] = 64; rp[9] = 1;
+    wr32(rp + 12, 0x0A000202);                       /* gonderen: gateway */
+    wr32(rp + 16, our_ip);
+    wr16(rp + 10, 0);
+    wr16(rp + 10, ip_checksum(rp, 20));
+    rp[20] = 5; rp[21] = 1;                          /* redirect, host */
+    wr32(rp + 24, ngw);
+    rp[28] = 0x45; wr32(rp + 44, 0x08080808);        /* gomulu: dst 8.8.8.8 */
+    wr16(rp + 22, 0);
+    wr16(rp + 22, ip_checksum(rp + 20, 40));
+    handle_ipv4(rp, (uint16_t)(20 + 40), NULL);
+    if (!redir.used || redir.dst != 0x08080808 || redir.nexthop != ngw) return false;
+
+    uint8_t macN[6] = { 0x02, 0, 0, 0, 0, 0x07 };
+    arp_learn(ngw, macN);
+    ethsnoop = true; ethsnoop_n = 0;
+    int s = net_udp_socket();
+    bool ok = false;
+    if (s >= 0 && net_udp_bind(s, 0)) {
+        if (net_udp_send_to(s, 0x08080808, 9999, (const uint8_t*)"x", 1) == 1 &&
+            ethsnoop_n >= 1 &&
+            memcmp(ethsnoop_frame[0], macN, 6) == 0 &&
+            rd16(ethsnoop_frame[0] + 12) == 0x0800)
+            ok = true;
+        net_udp_close(s);
+    }
+    ethsnoop = false;
+    if (!ok) { redir.used = false; return false; }
+    redir.used = false; redir.dst = 0; redir.nexthop = 0;
+
+    /* 3) parca zaman asimi -> ICMP time-exceeded (tip 11, kod 1) */
+    uint8_t mac3[6] = { 0x02, 0, 0, 0, 0, 0x03 };
+    arp_learn(0x0A000201, mac3);
+    uint8_t fg[28];
+    memset(fg, 0, sizeof(fg));
+    fg[0] = 0x45; wr16(fg + 2, 28); fg[8] = 64; fg[9] = 1;
+    wr16(fg + 6, 0x2000);                            /* MF=1 parca */
+    wr32(fg + 12, 0x0A000201);
+    wr32(fg + 16, our_ip);
+    wr16(fg + 10, 0);
+    wr16(fg + 10, ip_checksum(fg, 20));
+    ethsnoop = true; ethsnoop_n = 0;
+    handle_ipv4(fg, 28, NULL);
+    if (!ipf_armed) { ethsnoop = false; return false; }
+    ipf_expire = 1;                                   /* zaman dolmus olsun */
+    frag_expiry_poll();
+    ethsnoop = false;
+    if (ethsnoop_n < 1) return false;
+    const uint8_t* f = ethsnoop_frame[0] + 14;
+    if (f[9] != 1) return false;                      /* ICMP */
+    if (f[20] != 11 || f[21] != 1) return false;      /* time exceeded / parca */
+    for (int i = 0; i < 2; i++) ipf_clear(i);
+    ipf_armed = false;
     return true;
 }
 
@@ -1884,6 +2276,7 @@ extern "C" void net_tcp_poll(int s) {
 extern "C" void net_tcp_poll_all(void) {
     for (int i = 0; i < TCP_SOCKS; i++)
         if (conns[i].used) tcp_poll_guarded(conns[i]);
+    net_aux_tick();
 }
 
 extern "C" uint32_t net_tcp_pending(int s) {
@@ -1927,6 +2320,25 @@ extern "C" int net_tcp_accept(int s, uint32_t ticks) {
         uint64_t dd = timer_get_ticks() + 20;   /* ~200ms dilim */
         while (timer_get_ticks() < dd && !sys_intr_pending()) { sys_intr_poll(); cpu_hlt(); }
     }
+}
+
+/* Beklemeden accept: simdi ESTABLISHED olan ilk cocugu dondurur (yoksa -1).
+   Eszamanli pasif sunucular (httpd) kullanir. */
+extern "C" int net_tcp_accept_nb(int s) {
+    if (s < 0 || s >= TCP_SOCKS || !conns[s].used) return -1;
+    int best = -1;
+    uint64_t bt = ~0ull;
+    for (int i = 0; i < TCP_SOCKS; i++) {
+        if (i == s) continue;
+        if (conns[i].used && conns[i].lfd == s && conns[i].st == 2) {
+            if (conns[i].created_at < bt) { bt = conns[i].created_at; best = i; }
+        }
+    }
+    if (best >= 0) {
+        conns[best].done = false; conns[best].err = false;
+        return best;
+    }
+    return -1;
 }
 
 /* Veri gelene kadar (veya zaman asimi) bekle; gelen baytlari dondur. */
@@ -1987,6 +2399,38 @@ extern "C" void net_tcp_close(int s) {
     else if (t.st == 3 || t.st == 4) { }
     /* aktif kapanis bebegi: peer FIN'i close_at sinirina kadar beklenir */
     else if (t.ok || t.fin_rx || t.err) { t.used = 0; t.st = 0; t.st_v = 0; }
+}
+
+/* Otomatik kira yenileme (IRQ/timer yolunda, engelleyici degil): T1 (%50) esikte
+   REQUEST gonderilir; ACK surene kadar sureci tekrar edilir. */
+static void dhcp_auto_poll(void) {
+    uint64_t now = timer_get_ticks();
+    if (!dhcp_lease_until || dhcp_waiting || !our_ip) return;
+    if (now >= dhcp_lease_until) return;             /* kira bitmis: elle islem gerekir */
+    uint64_t t1 = dhcp_lease_until - (uint64_t)dhcp_lease * 50u;   /* T1 = kiranin %50'si */
+    if (now < t1) return;
+    if (dhcp_renew_pend) {
+        if (now < dhcp_renew_at) return;
+        dhcp_renew_at = now + 100;                   /* ~1 sn'de bir tekrar dene */
+    } else {
+        dhcp_renew_pend = true;
+        dhcp_renew_at = now + 100;
+    }
+    dhcp_txid = (uint32_t)((timer_get_ticks() * 2654435761u) ^ 0xBEEF11) + dhcp_renew_pend;
+    dhcp_phase = 3;
+    dhcp_done = false;
+    uint8_t b[272];
+    uint8_t* e = dhcp_build(b, 3);
+    udp_send(0xFFFFFFFFu, 67, 68, b, (uint16_t)(e - b));
+}
+
+/* Arayuz arka plan isleri (her tik, IRQ yolunda): komsu yaslandirmasi,
+   redirect omru, parca zaman asimi ve DHCP kira yenilemesi. */
+static void net_aux_tick(void) {
+    arp_aging_poll();
+    if (redir.used && timer_get_ticks() >= redir.until) { redir.used = false; redir.dst = 0; redir.nexthop = 0; }
+    frag_expiry_poll();
+    dhcp_auto_poll();
 }
 
 } /* namespace */
@@ -2051,19 +2495,21 @@ extern "C" bool net_ping(uint32_t ip) {
 
 extern "C" bool net_dhcp(void) {
     dhcp_txid = (uint32_t)(timer_get_ticks() * 2654435761u) ^ 0xE17A11;
+    dhcp_waiting = true;
+    dhcp_phase = 1;
+    dhcp_nak = false;
+    dhcp_renew_pend = false;
     uint64_t wall = timer_get_ticks() + 300;         /* ~3 sn toplam sure */
     bool got_offer = false;
 
     while (timer_get_ticks() < wall && !got_offer && !sys_intr_pending()) {
-        dhcp_waiting = true;
-        dhcp_phase = 1;
         dhcp_done = false;
         uint8_t b[272];
         uint8_t* e = dhcp_build(b, 1);               /* DISCOVER */
         udp_send(0xFFFFFFFFu, 67, 68, b, (uint16_t)(e - b));
         uint64_t t = timer_get_ticks() + 30;         /* 300ms OFFER bekle */
         while (!dhcp_done && timer_get_ticks() < t && !sys_intr_pending()) { sys_intr_poll(); cpu_hlt(); }
-        got_offer = dhcp_done;
+        got_offer = dhcp_done && !dhcp_nak;
     }
     if (!got_offer) { dhcp_waiting = false; return false; }
 
@@ -2071,27 +2517,67 @@ extern "C" bool net_dhcp(void) {
     while (timer_get_ticks() < wall && !dhcp_done && !sys_intr_pending()) {
         dhcp_phase = 3;
         dhcp_done = false;
+        dhcp_nak = false;
         uint8_t b[272];
         uint8_t* e = dhcp_build(b, 3);               /* REQUEST */
         udp_send(0xFFFFFFFFu, 67, 68, b, (uint16_t)(e - b));
         uint64_t t = timer_get_ticks() + 30;
         while (!dhcp_done && timer_get_ticks() < t && !sys_intr_pending()) { sys_intr_poll(); cpu_hlt(); }
+        if (dhcp_done && dhcp_nak) {                 /* NAK: sunucu reddetti -> basa don */
+            dhcp_phase = 1;
+            got_offer = false;
+            break;
+        }
     }
     dhcp_waiting = false;
-    if (!dhcp_done) return false;
+    if (!dhcp_done || dhcp_nak) return false;
 
     our_ip    = dhcp_offer_ip;
     our_mask  = dhcp_offer_mask ? dhcp_offer_mask : 0xFFFFFF00u;
     gateway   = dhcp_offer_router;
     dns_server = dhcp_offer_dns;
+    if (!dhcp_lease_until) dhcp_apply_lease((uint16_t)dhcp_lease);
     for (int i = 0; i < 8; i++) arp_cache[i].valid = false;
     return true;
+}
+
+/* Kirayi yenile (RFC 2131 4.4.5): REQUEST ciaddr+sunucu ile; ACK -> kira uzar,
+   NAK/zaman asimi -> false (cagiran DISCOVER ile basa doner). */
+extern "C" bool net_dhcp_renew(void) {
+    if (!nic_up() || !our_ip) return false;
+    dhcp_txid = (uint32_t)((timer_get_ticks() * 2654435761u) ^ 0xE17A11) + 0x77;
+    dhcp_waiting = true;
+    dhcp_phase = 3;
+    dhcp_done = false;
+    dhcp_nak = false;
+    dhcp_renew_pend = false;
+    uint8_t b[272];
+    uint8_t* e = dhcp_build(b, 3);                   /* ciaddr = our_ip (dhcp_build) */
+    udp_send(0xFFFFFFFFu, 67, 68, b, (uint16_t)(e - b));
+    uint64_t t = timer_get_ticks() + 60;             /* ~600ms ACK/NAK bekle */
+    while (!dhcp_done && timer_get_ticks() < t && !sys_intr_pending()) { sys_intr_poll(); cpu_hlt(); }
+    dhcp_waiting = false;
+    if (dhcp_done && !dhcp_nak) {
+        our_ip = dhcp_offer_ip;
+        if (dhcp_offer_mask) our_mask = dhcp_offer_mask;
+        if (dhcp_offer_router) gateway = dhcp_offer_router;
+        if (dhcp_offer_dns) dns_server = dhcp_offer_dns;
+        return true;
+    }
+    return false;
 }
 
 extern "C" bool net_dns_resolve(const char* name, uint32_t* out_ip) {
     if (!nic_up()) return false;
     if (!name || !*name) return false;
+
+    if (dns_cache_lookup(name, out_ip)) return true;   /* onbellekten */
+
     uint32_t server = dns_server ? dns_server : 0x0A000203u;
+
+    char qn[128];
+    for (int i = 0; i < 127 && name[i]; i++) qn[i] = name[i];
+    qn[127] = 0;
 
     int s = net_udp_socket();
     if (s < 0) return false;
@@ -2099,26 +2585,46 @@ extern "C" bool net_dns_resolve(const char* name, uint32_t* out_ip) {
 
     bool ok = false;
     uint32_t result = 0;
-    for (int attempt = 0; attempt < 3 && !ok; attempt++) {
-        uint16_t id = (uint16_t)((timer_get_ticks() + (uint64_t)attempt) * 0x9E37u) | 0x8000u;
-        uint8_t q[280];
-        int qlen = dns_query(q, id, name);
-        if (qlen < 32) { memset(q + qlen, 0, 32 - qlen); qlen = 32; }
-        net_udp_send_to(s, server, 53, q, (uint16_t)qlen);
+    uint32_t ttl = 0;
+    for (int hop = 0; hop < 8 && !ok; hop++) {         /* CNAME zinciri (RFC 1034 3.6.2) */
+        bool hop_ok = false;
+        bool is_cname = false;
+        for (int attempt = 0; attempt < 3 && !hop_ok; attempt++) {
+            uint16_t id = (uint16_t)((timer_get_ticks() + (uint64_t)attempt + hop) * 0x9E37u) | 0x8000u;
+            uint8_t q[280];
+            int qlen = dns_query(q, id, qn);
+            if (qlen < 32) { memset(q + qlen, 0, 32 - qlen); qlen = 32; }
+            net_udp_send_to(s, server, 53, q, (uint16_t)qlen);
 
-        uint8_t r[512];
-        uint64_t t = timer_get_ticks() + 100;        /* 1 sn bekleyis */
-        while (!ok && timer_get_ticks() < t && !sys_intr_pending()) {
-            sys_intr_poll();
-            int got = net_udp_recv_from(s, r, sizeof(r), NULL, NULL);
-            if (got > 0) {
-                if (got >= 12 && rd16(r) == id)      /* gecikmis/yanlis id dusur */
-                    ok = dns_parse_a(r, (uint16_t)got, &result);
+            uint8_t r[512];
+            uint64_t t = timer_get_ticks() + 100;      /* 1 sn bekleyis */
+            while (!hop_ok && timer_get_ticks() < t && !sys_intr_pending()) {
+                sys_intr_poll();
+                int got = net_udp_recv_from(s, r, sizeof(r), NULL, NULL);
+                if (got > 0) {
+                    if (got >= 12 && rd16(r) == id) {  /* gecikmis/yanlis id dusur */
+                        char cname[128] = "";
+                        int st = dns_parse_ans(r, (uint16_t)got, &result, &ttl, cname, sizeof(cname));
+                        if (st == 1) { ok = true; hop_ok = true; }
+                        else if (st == 2 && cname[0]) {
+                            is_cname = true;
+                            for (int i = 0; i < 127 && cname[i]; i++) qn[i] = cname[i];
+                            qn[127] = 0;
+                            hop_ok = true;             /* bir sonraki adima gec */
+                        }
+                    }
+                }
+                cpu_hlt();
             }
-            cpu_hlt();
         }
+        if (!hop_ok && !is_cname) break;
+        if (ok) break;
     }
     net_udp_close(s);
+    if (ok && result) {                                /* negatif (0) onbellelenmez */
+        if (ttl == 0) ttl = 60;                        /* asgari omur: kisa atlar kacinin */
+        dns_cache_store(name, result, ttl);
+    }
     if (out_ip && ok) *out_ip = result;
     return ok;
 }
@@ -2187,6 +2693,9 @@ extern "C" void net_ifconfig(void) {
     kprintf("eth0  DNS  : %u.%u.%u.%u\n",
             (dns_server >> 24) & 0xFF, (dns_server >> 16) & 0xFF,
             (dns_server >> 8) & 0xFF, dns_server & 0xFF);
+    if (dhcp_lease_until)
+        kprintf("eth0  Kira : %u sn kaldi\n", (unsigned)(dhcp_lease_until > timer_get_ticks()
+                ? (dhcp_lease_until - timer_get_ticks()) / 100u : 0u));
     kprintf("eth0  MAC  : %02x:%02x:%02x:%02x:%02x:%02x\n",
             our_mac[0], our_mac[1], our_mac[2], our_mac[3], our_mac[4], our_mac[5]);
     kprintf("istatistik  : rx=%llu tx=%llu rx-bayt=%llu\n",
@@ -2198,6 +2707,16 @@ extern "C" uint32_t net_get_dns(void) { return dns_server; }
 extern "C" uint32_t net_get_ip(void) { return our_ip; }
 extern "C" uint32_t net_get_mask(void) { return our_mask; }
 extern "C" uint32_t net_get_gw(void) { return gateway; }
+
+/* Kira yenilendiyse kalan sure (sn); yoksa 0. */
+extern "C" uint32_t net_dhcp_lease(void) {
+    if (!dhcp_lease_until) return 0;
+    uint64_t now = timer_get_ticks();
+    if (now >= dhcp_lease_until) return 0;
+    return (uint32_t)((dhcp_lease_until - now) / 100u);
+}
+
+extern "C" uint32_t net_dns_cache_hits(void) { return dns_cache_hits; }
 
 extern "C" bool net_active(void) { return nic_up(); }
 

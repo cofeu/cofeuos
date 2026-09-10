@@ -7,6 +7,9 @@
 
 namespace {
 
+/* ---- httpd eszamanli servis kapasitesi ---- */
+constexpr int HTTPD_MAX = 6;
+
 /* ---- VGA renk yardimcilari (serial mirror'a dokunmaz) ---- */
 enum VGAC { VGA_BLACK=0x0, VGA_BLUE=0x1, VGA_GREEN=0x2, VGA_CYAN=0x3,
             VGA_RED=0x4, VGA_MAGENTA=0x5, VGA_BROWN=0x6, VGA_LIGHT_GRAY=0x7,
@@ -60,8 +63,9 @@ const char* HELP =
     "  ifconfig                 - ag arayuz bilgisi\n"
     "  dhcp                     - DHCP ile IP iste\n"
     "  dns <ad>                 - alan adini coz (A kaydi)\n"
+    "  dhcp [renew]             - DHCP ile IP iste / kirayi yenile\n"
     "  http <host> [yol] [dosya] - HTTP GET iste; govdeyi bulundugu dizine kaydet\n"
-    "  httpd [port]             - pasif HTTP sunucu (varsayilan 8080), tek baglanti\n"
+    "  httpd [port]             - pasif HTTP sunucu (varsayilan 8080), eszamanli servis\n"
     "  nettest                  - ag regresyon testi (ping/dns/http)\n"
     "  ping <a.b.c.d>           - ICMP echo gonder\n"
     "  reboot                   - yeniden baslat\n"
@@ -399,8 +403,17 @@ static void run_line_inner(char* line, uint32_t& cwd, char* cwdstr, const char* 
     }
     else if (strcmp(cmd, "dhcp") == 0) {
         if (!net_active()) kprintf("hata: ag arayuzu yok/aktif degil\n");
-        else if (net_dhcp()) {
-            kprintf("dhcp: tamam\n");
+        else if (t.n >= 2 && strcmp(t.tok[1], "renew") == 0) {
+            if (net_dhcp_renew())
+                kprintf("dhcp: yenilendi (kira %u sn)\n", (unsigned)net_dhcp_lease());
+            else {
+                kprintf("dhcp: yenileme baskisiz, DISCOVER ile basa donuluyor\n");
+                if (net_dhcp()) kprintf("dhcp: tamam (yeni kira)\n");
+                else           kprintf("dhcp: yeni kira da alinamadi\n");
+            }
+            net_ifconfig();
+        } else if (net_dhcp()) {
+            kprintf("dhcp: tamam (kira %u sn)\n", (unsigned)net_dhcp_lease());
             net_ifconfig();
         } else {
             kprintf("dhcp: zaman asimi (cevap yok)\n");
@@ -410,12 +423,14 @@ static void run_line_inner(char* line, uint32_t& cwd, char* cwdstr, const char* 
         if (t.n < 2) kprintf("kullanim: dns <alan adi>\n");
         else if (!net_active()) kprintf("hata: ag arayuzu yok\n");
         else {
+            uint32_t h0 = net_dns_cache_hits();
             uint32_t ip = 0;
             kprintf("cozuluyor: %s ...\n", t.tok[1]);
-            if (net_dns_resolve(t.tok[1], &ip))
-                kprintf("%s -> %u.%u.%u.%u\n", t.tok[1],
-                        (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
-            else
+            if (net_dns_resolve(t.tok[1], &ip)) {
+                const char* cached = (net_dns_cache_hits() > h0) ? " [onbellekten]" : "";
+                kprintf("%s -> %u.%u.%u.%u%s\n", t.tok[1],
+                        (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF, cached);
+            } else
                 kprintf("cozulemedi: %s\n", t.tok[1]);
         }
     }
@@ -530,35 +545,31 @@ static void run_line_inner(char* line, uint32_t& cwd, char* cwdstr, const char* 
             if (lfd < 0) { kprintf("httpd: soket yok\n"); }
             else if (!net_tcp_listen(lfd, port)) kprintf("httpd: dinleme basarisiz\n");
             else {
-                kprintf("httpd: %u portunda dinleniyor...\n", port);
-                for (;;) {
-                    if (sys_intr_pending()) { kprintf("httpd: iptal edildi\n"); break; }
-                    int cfd = net_tcp_accept(lfd, 0);      /* 0 = sonsuz bekleyis; Ctrl+C iptal eder */
-                    if (cfd < 0) {
-                        if (sys_intr_pending()) { sys_intr_clear(); kprintf("httpd: iptal edildi\n"); }
-                        else kprintf("httpd: accept hatasi\n");
-                        break;
-                    }
-                    /* Istek basligini topla ("\r\n\r\n" a kadar) */
-                    static char req[4096];
-                    uint32_t rn = 0;
-                    int empty = 0;
-                    uint64_t req_wall = timer_get_ticks() + 300;
-                    while (rn < sizeof(req) - 1 && timer_get_ticks() < req_wall && !sys_intr_pending()) {
-                        uint8_t c;
-                        if (net_tcp_recv_some(cfd, &c, 1, 5) == 1) {
-                            req[rn++] = (char)c;
-                            if (c == '\n') empty++;
-                            else if (c != '\r') empty = 0;
-                            if (empty >= 2) break;
-                        } else if (net_tcp_done(cfd) || net_tcp_err(cfd)) break;
-                    }
-                    req[rn] = 0;
-                    kprintf("httpd: geldi (%u bayt)\n", rn);
+                kprintf("httpd: %u portunda dinleniyor (%u eszamanli baglanti)...\n", port, HTTPD_MAX);
+                enum { H_READ, H_SEND, H_WAIT, H_FREE };
+                struct HttpConn {
+                    int      fd;
+                    int      st;
+                    uint32_t rn;
+                    uint32_t off;
+                    uint32_t rlen;
+                    uint64_t since;
+                    char     req[2048];
+                    uint8_t  resp[8192 + 512];
+                };
+                static HttpConn hc[HTTPD_MAX];
+                for (int i = 0; i < HTTPD_MAX; i++) { hc[i].fd = -1; hc[i].st = H_FREE; }
+
+                auto close_conn = [&](int i) {
+                    net_tcp_close(hc[i].fd);
+                    hc[i].fd = -1; hc[i].st = H_FREE;
+                };
+                auto build_resp = [&](int i) {
                     /* Yolu cikar: "GET /pat HTTP/1.1" */
                     char path[256] = "/";
-                    if (req[0] == 'G' && req[1] == 'E' && req[2] == 'T') {
-                        const char* s = req + 4;
+                    const char* rr = hc[i].req;
+                    if (rr[0] == 'G' && rr[1] == 'E' && rr[2] == 'T') {
+                        const char* s = rr + 4;
                         while (*s == ' ') s++;
                         int pl = 0;
                         while (*s && *s != ' ' && pl < 254) path[pl++] = *s++;
@@ -567,33 +578,111 @@ static void run_line_inner(char* line, uint32_t& cwd, char* cwdstr, const char* 
                     fs::EntryInfo st;
                     char body[8192];
                     uint32_t bl = 0;
-                    static char resp[9000];
-                    int rlen = 0;
                     const char* ctype = "text/plain";
                     if (fs::stat(0, path, &st) && st.type_ == 1) {
-                        if (!fs::read_file(0, path, body, sizeof(body), &bl)) { bl = 0; }
-                        rlen = ksnprintf(resp, sizeof(resp),
+                        if (!fs::read_file(0, path, body, sizeof(body), &bl)) bl = 0;
+                        hc[i].rlen = (uint32_t)ksnprintf((char*)hc[i].resp, sizeof(hc[i].resp),
                             "HTTP/1.0 200 OK\r\nContent-Type: %s\r\nContent-Length: %u\r\n\r\n",
                             ctype, bl);
-                        memcpy(resp + rlen, body, bl > 0 ? bl : 0);
-                        rlen += (int)bl;
+                        if (bl > sizeof(hc[i].resp) - hc[i].rlen) bl = (uint32_t)(sizeof(hc[i].resp) - hc[i].rlen);
+                        memcpy(hc[i].resp + hc[i].rlen, body, bl);
+                        hc[i].rlen += bl;
                     } else {
-                        rlen = ksnprintf(resp, sizeof(resp),
+                        hc[i].rlen = (uint32_t)ksnprintf((char*)hc[i].resp, sizeof(hc[i].resp),
                             "HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n");
                     }
-                    /* Govdeyi segmentlere bolerek gonder */
-                    uint32_t off = 0;
-                    while (off < (uint32_t)rlen && !sys_intr_pending()) {
-                        uint32_t chunk = (uint32_t)(rlen - off);
-                        if (chunk > 1460) chunk = 1460;
-                        net_tcp_send(cfd, (const uint8_t*)resp + off, (uint16_t)chunk);
-                        net_tcp_wait(cfd, 10);
-                        off += chunk;
+                    hc[i].off = 0;
+                };
+
+                for (;;) {
+                    if (sys_intr_pending()) { kprintf("httpd: iptal edildi\n"); break; }
+
+                    /* yeni baglantilari kabul et (beklemeden) */
+                    int freec = -1;
+                    for (int i = 0; i < HTTPD_MAX && freec < 0; i++) if (hc[i].st == H_FREE) freec = i;
+                    if (freec >= 0) {
+                        int cfd = net_tcp_accept_nb(lfd);
+                        if (cfd >= 0) {
+                            hc[freec].fd = cfd; hc[freec].st = H_READ;
+                            hc[freec].rn = 0; hc[freec].since = timer_get_ticks();
+                            int act = 0;
+                            for (int k = 0; k < HTTPD_MAX; k++) if (hc[k].st != H_FREE) act++;
+                            kprintf("httpd: baglanti kabul (%d aktif)\n", act);
+                        }
                     }
-                    kprintf("httpd: %u bayt yanit gonderildi\n", rlen);
-                    net_tcp_close(cfd);
-                    sys_intr_clear();
+
+                    bool any = false;
+                    for (int i = 0; i < HTTPD_MAX; i++) {
+                        if (hc[i].st == H_FREE) continue;
+                        any = true;
+                        int fd = hc[i].fd;
+                        if (net_tcp_done(fd) || net_tcp_err(fd)) {
+                            kprintf("httpd: %s kapatildi\n", net_tcp_err(fd) ? "hata" : "kapanis");
+                            close_conn(i);
+                            continue;
+                        }
+                        uint64_t now = timer_get_ticks();
+                        if (hc[i].st == H_READ) {
+                            while (hc[i].rn < sizeof(hc[i].req) - 1 &&
+                                   now - hc[i].since < 300) {
+                                uint8_t c;
+                                uint32_t n = net_tcp_recv_some(fd, &c, 1, 0);
+                                if (n != 1) break;
+                                hc[i].req[hc[i].rn++] = (char)c;
+                                if (hc[i].rn >= 4 &&
+                                    hc[i].req[hc[i].rn-4] == '\r' &&
+                                    hc[i].req[hc[i].rn-3] == '\n' &&
+                                    hc[i].req[hc[i].rn-2] == '\r' &&
+                                    hc[i].req[hc[i].rn-1] == '\n') {
+                                    hc[i].req[hc[i].rn] = 0;
+                                    build_resp(i);
+                                    hc[i].st = H_SEND;
+                                    kprintf("httpd: geldi (%u bayt, yanit %u)\n", hc[i].rn, hc[i].rlen);
+                                    break;
+                                }
+                            }
+                            if (hc[i].st == H_READ && now - hc[i].since >= 300) {
+                                /* yavas istemci: beklemektense bosalt */
+                                close_conn(i);
+                                continue;
+                            }
+                        }
+                        if (hc[i].st == H_SEND) {
+                            while (hc[i].off < hc[i].rlen) {
+                                uint32_t chunk = hc[i].rlen - hc[i].off;
+                                if (chunk > 1460) chunk = 1460;
+                                if (!net_tcp_send(fd, hc[i].resp + hc[i].off, (uint16_t)chunk)) {
+                                    close_conn(i);
+                                    break;
+                                }
+                                hc[i].off += chunk;
+                                if (net_tcp_done(fd) || net_tcp_err(fd)) break;
+                            }
+                            if (hc[i].st != H_FREE && hc[i].off >= hc[i].rlen) {
+                                hc[i].st = H_WAIT;    /* kapanisi istemci bitirsin */
+                                hc[i].since = timer_get_ticks();
+                            }
+                        }
+                        if (hc[i].st == H_WAIT) {
+                            if (net_tcp_done(fd) || net_tcp_err(fd)) {
+                                kprintf("httpd: %u bayt gonderildi, kapanis\n", hc[i].rlen);
+                                close_conn(i);
+                            } else if (now - hc[i].since > 500) {
+                                kprintf("httpd: %u bayt gonderildi, kapatiliyor\n", hc[i].rlen);
+                                close_conn(i);
+                            }
+                        }
+                    }
+
+                    if (!any) {                /* boslukta calismayi durdur */
+                        net_tcp_poll_all();
+                        uint64_t dd = timer_get_ticks() + 10;
+                        while (timer_get_ticks() < dd && !sys_intr_pending()) { sys_intr_poll(); cpu_hlt(); }
+                    }
+                    net_tcp_poll_all();
                 }
+                for (int i = 0; i < HTTPD_MAX; i++)
+                    if (hc[i].st != H_FREE) close_conn(i);
             }
         }
     }
@@ -633,10 +722,30 @@ static void run_line_inner(char* line, uint32_t& cwd, char* cwdstr, const char* 
                 if (!net_tcp_ext_selftest()) { ok = false; step = 9; }
             }
 
+            if (ok) {
+                kprintf("nettest: adim1g arp yaslandirma + icmp redirect/time-exceeded ...\n");
+                if (!net_aux_selftest()) { ok = false; step = 10; }
+            }
+
+            if (ok) {
+                kprintf("nettest: adim1h dns CNAME + onbellek ...\n");
+                if (!net_dns_cache_selftest()) { ok = false; step = 11; }
+            }
+
+            if (ok) {
+                kprintf("nettest: adim1i dhcp kira/NAK/yenileme ...\n");
+                if (!net_dhcp_ext_selftest()) { ok = false; step = 12; }
+            }
+
             uint32_t dip = 0;
             if (ok) {
                 kprintf("nettest: adim2 dns google.com ...\n");
                 if (!net_dns_resolve("google.com", &dip)) { ok = false; step = 2; }
+                else {                                   /* yeniden cozum onbellekten gelmeli */
+                    uint32_t h0 = net_dns_cache_hits();
+                    if (!net_dns_resolve("google.com", &dip)) { ok = false; step = 2; }
+                    else if (net_dns_cache_hits() == h0) { ok = false; step = 2; }
+                }
             }
             uint32_t eip = 0;
             if (ok) {
