@@ -737,6 +737,11 @@ static void run_line_inner(char* line, uint32_t& cwd, char* cwdstr, const char* 
                 if (!net_dhcp_ext_selftest()) { ok = false; step = 12; }
             }
 
+            if (ok) {
+                kprintf("nettest: adim1j ipv6 NDP/ICMPv6/SLAAC ...\n");
+                if (!net_ip6_selftest()) { ok = false; step = 13; }
+            }
+
             uint32_t dip = 0;
             if (ok) {
                 kprintf("nettest: adim2 dns google.com ...\n");
@@ -772,6 +777,21 @@ static void run_line_inner(char* line, uint32_t& cwd, char* cwdstr, const char* 
             else {
                 kprintf("PING %s (64 bayt):\n", t.tok[1]);
                 if (net_ping(ip))
+                    kprintf("cevap! %s makinesinden\n", t.tok[1]);
+                else
+                    kprintf("zaman asimi (cevap yok)\n");
+            }
+        }
+    }
+    else if (strcmp(cmd, "ping6") == 0) {
+        if (t.n < 2) kprintf("kullanim: ping6 <ipv6-adresi>\n");
+        else {
+            uint8_t a6[16];
+            if (!net_ip6_parse(t.tok[1], a6)) { kprintf("hata: gecersiz IPv6 adresi\n"); }
+            else if (!net_active()) { kprintf("hata: ag arayuzu yok\n"); }
+            else {
+                kprintf("PING6 %s (56 bayt):\n", t.tok[1]);
+                if (net_ping6(a6, 64))
                     kprintf("cevap! %s makinesinden\n", t.tok[1]);
                 else
                     kprintf("zaman asimi (cevap yok)\n");

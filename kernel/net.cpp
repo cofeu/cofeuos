@@ -2424,10 +2424,349 @@ static void dhcp_auto_poll(void) {
     udp_send(0xFFFFFFFFu, 67, 68, b, (uint16_t)(e - b));
 }
 
+/* ================= IPv6 (RFC 8200) + ICMPv6/NDP (RFC 4443/4861) =============
+   Adres durumu: EUI-64 temelli link-local (fe80::/10) + RA'dan SLAAC global.
+   NDP: NS/NA ile komsu cozumleme (ARP'nin IPv6 karsiligi), RS ile yonlendirici
+   uyandirma, RA ile ag geçidi + global adres. IPv6 socket'leri (UDP/TCP) bu
+   fazın kapsamı dışı: next-header 17/6 yukarı iletilir ama dusulur (dual-stack
+   ayrı faz). DAD de bilincli olarak atlandı (tek-komşulu QEMU/slirp ortamı).  */
+
+uint8_t  ip6_ll[16];
+bool     ip6_ll_ok = false;
+uint8_t  ip6_global[16];
+bool     ip6_global_ok = false;
+uint8_t  ip6_prefix[8];
+uint32_t ip6_prefix_len = 0;
+uint8_t  gateway6[16];
+bool     gateway6_ok = false;
+
+struct Nd6Entry {
+    uint8_t  ip[16];
+    uint8_t  mac[6];
+    bool     valid;
+    uint64_t at;
+};
+Nd6Entry nd6_cache[8];
+constexpr uint64_t NDP_AGE = 600;          /* komu girisinin yaslanma esigi (tick) */
+
+volatile bool       ndp_waiting = false, ndp_done = false;
+uint8_t             ndp_want[16];
+uint8_t             ndp_reply_mac[6];
+
+volatile bool       ping6_active = false, ping6_done = false;
+volatile uint16_t   ping6_ident = 0;
+uint8_t             ping6_reply_src[16];
+uint8_t             ping6_want[16];
+
+/* Router Solicitation yeniden deneniyor (RA gelene kadar en fazla 3 kez) */
+volatile bool       rs_pend_on = false;
+volatile int        rs_tries = 0;
+volatile uint64_t   rs_at = 0;
+
+bool ip6_eq(const uint8_t* a, const uint8_t* b) {
+    for (int i = 0; i < 16; i++) if (a[i] != b[i]) return false;
+    return true;
+}
+
+bool ip6_is_ll(const uint8_t* a) { return a[0] == 0xFE && (a[1] & 0xC0) == 0x80; }
+bool ip6_is_mcast(const uint8_t* a) { return a[0] == 0xFF; }
+
+/* ön bildirimler (tanımlar asagida) */
+void ipv6_send(const uint8_t* src6, const uint8_t* dst6, uint8_t nh,
+               const uint8_t* payload, uint16_t len, const uint8_t* dmac);
+void ip6_compute_ll(void);
+void ip6_solicited(const uint8_t* tgt, uint8_t* m);
+bool nd6_lookup(const uint8_t* ip, uint8_t* mac);
+void nd6_learn(const uint8_t* ip, const uint8_t* mac);
+uint16_t icmp6_checksum(const uint8_t* src6, const uint8_t* dst6,
+                        const uint8_t* d, uint16_t len);
+
+/* ilk 8 baytlık ön ek + MAC'ten EUI-64 arayuz kimligi (RFC 4291 2.5.1) */
+void ip6_from_eui64(uint8_t* out, const uint8_t* pre8) {
+    memcpy(out, pre8, 8);
+    out[8] = our_mac[0] ^ 0x02;      /* evrensel/yerel bit cevrilir */
+    out[9] = our_mac[1];
+    out[10] = our_mac[2];
+    out[11] = 0xFF;
+    out[12] = 0xFE;
+    out[13] = our_mac[3];
+    out[14] = our_mac[4];
+    out[15] = our_mac[5];
+}
+
+void ip6_compute_ll(void) {
+    static const uint8_t fe80[8] = { 0xFE, 0x80, 0, 0, 0, 0, 0, 0 };
+    ip6_from_eui64(ip6_ll, fe80);
+    ip6_ll_ok = true;
+}
+
+/* hedefin solicited-node multicast adresi (ff02::1:ffXX:XXXX) */
+void ip6_solicited(const uint8_t* tgt, uint8_t* m) {
+    static const uint8_t pre[13] = { 0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xFF };
+    memcpy(m, pre, 13);
+    m[13] = tgt[13]; m[14] = tgt[14]; m[15] = tgt[15];
+}
+
+/* IPv6 cok noktali gonderim icin ethernet adresi (RFC 2464) */
+void ip6_mcast_mac(const uint8_t* a6, uint8_t* dmac) {
+    dmac[0] = 0x33; dmac[1] = 0x33;
+    dmac[2] = a6[12]; dmac[3] = a6[13]; dmac[4] = a6[14]; dmac[5] = a6[15];
+}
+
+/* ICMPv6 checksum: sagde gosterge basligi (src+dst+uzunluk+nh58) user baslikla */
+uint16_t icmp6_checksum(const uint8_t* src6, const uint8_t* dst6,
+                        const uint8_t* d, uint16_t len) {
+    uint32_t sum = 0;
+    for (int i = 0; i < 16; i += 2) sum += ((uint32_t)src6[i] << 8) | src6[i + 1];
+    for (int i = 0; i < 16; i += 2) sum += ((uint32_t)dst6[i] << 8) | dst6[i + 1];
+    sum += (uint32_t)len;
+    sum += 58;                                   /* next header (ICMPv6) */
+    for (int i = 0; i < len; i += 2) {
+        sum += ((uint32_t)d[i] << 8) | ((uint32_t)((i + 1 < len) ? d[i + 1] : 0));
+    }
+    while (sum >> 16) sum = (sum & 0xFFFFu) + (sum >> 16);
+    return (uint16_t)~sum;
+}
+
+/* ---- IPv6 komu cache (NDP) ---- */
+void nd6_learn(const uint8_t* ip, const uint8_t* mac) {
+    if (ip6_is_mcast(ip)) return;
+    uint64_t now = timer_get_ticks();
+    for (int i = 0; i < 8; i++) {
+        if (nd6_cache[i].valid && ip6_eq(nd6_cache[i].ip, ip)) {
+            memcpy(nd6_cache[i].mac, mac, 6);
+            nd6_cache[i].at = now;
+            return;
+        }
+    }
+    for (int i = 0; i < 8; i++)
+        if (!nd6_cache[i].valid) {
+            nd6_cache[i].valid = true;
+            memcpy(nd6_cache[i].ip, ip, 16);
+            memcpy(nd6_cache[i].mac, mac, 6);
+            nd6_cache[i].at = now;
+            return;
+        }
+}
+
+static void nd6_aging_poll(void) {
+    uint64_t now = timer_get_ticks();
+    for (int i = 0; i < 8; i++)
+        if (nd6_cache[i].valid && now - nd6_cache[i].at >= NDP_AGE)
+            nd6_cache[i].valid = false;
+}
+
+bool nd6_lookup(const uint8_t* ip, uint8_t* mac) {
+    if (ip6_is_mcast(ip)) { ip6_mcast_mac(ip, mac); return true; }
+    for (int i = 0; i < 8; i++)
+        if (nd6_cache[i].valid && ip6_eq(nd6_cache[i].ip, ip)) {
+            memcpy(mac, nd6_cache[i].mac, 6);
+            nd6_cache[i].at = timer_get_ticks();
+            return true;
+        }
+    return false;
+}
+
+/* NS gonderip NA ile komu MAC'ini coz (IRQ disi, engelleyici; 300ms x 3) */
+bool nd6_resolve(const uint8_t* src6, const uint8_t* tgt, uint8_t* mac) {
+    if (nd6_lookup(tgt, mac)) return true;
+
+    uint64_t fl;
+    asm volatile("pushfq; pop %0" : "=r"(fl));
+    if (!(fl & (1u << 9))) return false;               /* IRQ icinde (IF=0): bloke etme */
+
+    uint8_t sn[16];
+    ip6_solicited(tgt, sn);
+    for (int attempt = 0; attempt < 3 && !ndp_done; attempt++) {
+        uint8_t ns[32];
+        memset(ns, 0, 32);
+        ns[0] = 135;                                   /* NS */
+        ns[4] = ns[5] = ns[6] = ns[7] = 0;             /* reserved */
+        memcpy(ns + 8, tgt, 16);
+        ns[24] = 1; ns[25] = 1;                        /* kaynak link-layer secenegi */
+        memcpy(ns + 26, our_mac, 6);
+        wr16(ns + 2, icmp6_checksum(src6, sn, ns, 32));
+        ipv6_send(src6, sn, 58, ns, 32, NULL);         /* multicast'a dogrudan */
+        memcpy(ndp_want, tgt, 16);
+        ndp_waiting = true; ndp_done = false;
+        uint64_t deadline = timer_get_ticks() + 30;
+        while (!ndp_done && timer_get_ticks() < deadline && !sys_intr_pending()) { sys_intr_poll(); cpu_hlt(); }
+    }
+    ndp_waiting = false;
+    if (!ndp_done) return false;
+    memcpy(mac, ndp_reply_mac, 6);
+    nd6_learn(tgt, mac);
+    return true;
+}
+
+/* ---- IPv6 gonderimi ---- */
+void ipv6_send(const uint8_t* src6, const uint8_t* dst6, uint8_t nh,
+               const uint8_t* payload, uint16_t len, const uint8_t* dmac) {
+    uint8_t tmp[6];
+    if (!dmac) {
+        if (ip6_is_mcast(dst6)) {
+            ip6_mcast_mac(dst6, tmp); dmac = tmp;
+        } else {
+            uint8_t next[16];
+            bool offlink = !ip6_is_ll(dst6) && ip6_prefix_len == 64 &&
+                           memcmp(dst6, ip6_prefix, 8) != 0;
+            if (offlink && gateway6_ok) memcpy(next, gateway6, 16);
+            else memcpy(next, dst6, 16);
+            if (!nd6_resolve(src6, next, tmp)) return;
+            dmac = tmp;
+        }
+    }
+    uint8_t buf[40 + 1500];
+    memset(buf, 0, 40);
+    buf[0] = 0x60;                                   /* v6, tc=0, flow=0 */
+    wr16(buf + 4, len);                              /* payload uzunlugu */
+    buf[6] = nh;
+    buf[7] = 64;                                     /* hop limit */
+    memcpy(buf + 8, src6, 16);
+    memcpy(buf + 24, dst6, 16);
+    memcpy(buf + 40, payload, len);
+    eth_send(dmac, 0x86DD, buf, (uint16_t)(40 + len));
+}
+
+/* ---- NDP mesajlari ---- */
+void ndp_send_ready(void) {
+    uint8_t p[24];
+    memset(p, 0, 24);
+    p[0] = 133;                                      /* RS */
+    p[8] = 1; p[9] = 1;                              /* kaynak link-layer */
+    memcpy(p + 10, our_mac, 6);
+    static const uint8_t allr[16] = { 0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 };
+    wr16(p + 2, icmp6_checksum(ip6_ll, allr, p, 24));
+    ipv6_send(ip6_ll, allr, 58, p, 24, NULL);
+}
+
+static void ip6_slaac_poll(void) {
+    if (!gateway6_ok) {
+        if (!rs_pend_on) return;
+        if (rs_tries >= 3) { rs_pend_on = false; return; }
+        if (timer_get_ticks() < rs_at) return;
+        ndp_send_ready();
+        rs_tries++;
+        rs_at = timer_get_ticks() + 50;              /* ~0.5 sn sonra yeniden dene */
+    } else {
+        rs_pend_on = false;
+    }
+}
+
+/* ---- ICMPv6 (RFC 4443) + NDP islemi ---- */
+void handle_icmp6(const uint8_t* icmp, uint16_t iclen,
+                  const uint8_t* eth_src, const uint8_t* src6, const uint8_t* dst6) {
+    if (iclen < 4) return;
+    if (icmp6_checksum(src6, dst6, icmp, iclen) != 0) return;
+
+    if (icmp[0] == 128) {                            /* echo istek -> yanit (istek sahibine) */
+        const uint8_t* rtot = (ip6_eq(dst6, ip6_ll) ||
+                               (ip6_global_ok && ip6_eq(dst6, ip6_global))) ? dst6 : ip6_ll;
+        uint8_t resp[1500];
+        if (iclen > sizeof(resp)) iclen = sizeof(resp);
+        memcpy(resp, icmp, iclen);
+        resp[0] = 129;                               /* echo reply */
+        resp[1] = 0;
+        wr16(resp + 2, 0);
+        wr16(resp + 2, icmp6_checksum(rtot, src6, resp, iclen));
+        ipv6_send(rtot, src6, 58, resp, iclen, eth_src);
+    } else if (icmp[0] == 129 && ping6_active) {     /* echo yaniti bekleniyor */
+        if (rd16(icmp + 4) == ping6_ident && ip6_eq(src6, ping6_want)) {
+            memcpy(ping6_reply_src, src6, 16);
+            ping6_done = true;
+        }
+    } else if (icmp[0] == 135 && iclen >= 32) {      /* NS (RFC 4861 4.3) */
+        uint8_t tgt[16];
+        memcpy(tgt, icmp + 8, 16);
+        bool mine = ip6_eq(tgt, ip6_ll) || (ip6_global_ok && ip6_eq(tgt, ip6_global));
+        if (!mine) return;
+        /* kaynak link-layer secenegini ogren (varsa) ve istek sahibine NA gonder */
+        const uint8_t* o = icmp + 24;
+        int oend = (int)iclen;
+        while (o + 8 <= icmp + oend && o[1]) {
+            int olen = (int)o[1] * 8;
+            if (olen < 8 || o + olen > icmp + oend) break;
+            if (o[0] == 1) nd6_learn(src6, o + 2);
+            o += olen;
+        }
+        uint8_t na[32];
+        memset(na, 0, sizeof(na));
+        na[0] = 136; na[1] = 0;                      /* NA: S=1, O=1, R=0 */
+        na[4] = 0x60;
+        memcpy(na + 8, tgt, 16);
+        na[24] = 2; na[25] = 1;                      /* hedef link-layer secenegi */
+        memcpy(na + 26, our_mac, 6);
+        wr16(na + 2, icmp6_checksum(tgt, src6, na, sizeof(na)));
+        ipv6_send(tgt, src6, 58, na, sizeof(na), eth_src);
+    } else if (icmp[0] == 136 && iclen >= 24) {      /* NA: komu ogren / cevap bekle */
+        uint8_t tgt[16];
+        memcpy(tgt, icmp + 8, 16);
+        const uint8_t* o = icmp + 24;
+        int oend = (int)iclen;
+        while (o + 8 <= icmp + oend && o[1]) {
+            int olen = (int)o[1] * 8;
+            if (olen < 8 || o + olen > icmp + oend) break;
+            if (o[0] == 2) {
+                nd6_learn(tgt, o + 2);
+                if (ndp_waiting && ip6_eq(tgt, ndp_want)) {
+                    memcpy(ndp_reply_mac, o + 2, 6);
+                    ndp_done = true;
+                }
+            }
+            o += olen;
+        }
+    } else if (icmp[0] == 134) {                     /* RA (RFC 4861 4.2): geçit + SLAAC */
+        gateway6_ok = true;
+        memcpy(gateway6, src6, 16);
+        const uint8_t* o = icmp + 8;
+        int oend = (int)iclen;
+        while (o + 8 <= icmp + oend && o[1]) {
+            int olen = (int)o[1] * 8;
+            if (olen < 8 || o + olen > icmp + oend) break;
+            if (o[0] == 3 && olen >= 32) {           /* prefix bilgi secenegi */
+                uint8_t len = o[2];
+                uint8_t flags = o[3];
+                if (len == 64 && (flags & 0x40)) {   /* A: otomatik adres */
+                    uint8_t pre[8];
+                    memcpy(pre, o + 16, 8);
+                    if (!ip6_global_ok) {
+                        ip6_from_eui64(ip6_global, pre);
+                        memcpy(ip6_prefix, pre, 8);
+                        ip6_prefix_len = 64;
+                        ip6_global_ok = true;
+                    }
+                }
+            }
+            o += olen;
+        }
+    }
+    /* diger ICMPv6 turleri (yol cok buyuk, sure asimi vb.) sessizce dusulur */
+}
+
+/* ---- IPv6 RX ---- */
+void handle_ipv6(const uint8_t* ip6, uint16_t iplen6, const uint8_t* eth_src) {
+    if (iplen6 < 40) return;
+    if ((ip6[0] >> 4) != 6) return;
+    if (ip6[7] == 0) return;                         /* hop limit tukenmis */
+
+    const uint8_t* dst6 = ip6 + 24;
+    bool mine = ip6_eq(dst6, ip6_ll) || (ip6_global_ok && ip6_eq(dst6, ip6_global));
+    if (!mine && !(dst6[0] == 0xFF && dst6[1] == 0x02)) return;   /* ff02 multicast (NDP) */
+
+    const uint8_t* src6 = ip6 + 8;
+    uint8_t nh = ip6[6];
+    const uint8_t* ul = ip6 + 40;
+    uint16_t ulen = (uint16_t)(iplen6 - 40);
+    if (nh == 58) handle_icmp6(ul, ulen, eth_src, src6, dst6);
+    /* nh 17/6 (IPv6 UDP/TCP): dual-stack soket fazi tamamlanana kadar dusulur */
+}
+
 /* Arayuz arka plan isleri (her tik, IRQ yolunda): komsu yaslandirmasi,
    redirect omru, parca zaman asimi ve DHCP kira yenilemesi. */
 static void net_aux_tick(void) {
     arp_aging_poll();
+    nd6_aging_poll();
+    ip6_slaac_poll();
     if (redir.used && timer_get_ticks() >= redir.until) { redir.used = false; redir.dst = 0; redir.nexthop = 0; }
     frag_expiry_poll();
     dhcp_auto_poll();
@@ -2441,6 +2780,13 @@ extern "C" void net_init(const uint8_t mac[6], uint32_t ip, uint32_t mask, uint3
     our_mask = mask;
     gateway = gw;
     for (int i = 0; i < 8; i++) arp_cache[i].valid = false;
+    for (int i = 0; i < 8; i++) nd6_cache[i].valid = false;
+    ip6_global_ok = false; gateway6_ok = false;
+    ip6_prefix_len = 0;
+    ping6_active = ping6_done = false;
+    ndp_waiting = ndp_done = false;
+    rs_pend_on = true; rs_tries = 0;
+    ip6_compute_ll();
     stat_rx = stat_tx = stat_rx_bytes = 0;
     kslog("net: init ip=%u.%u.%u.%u mask=%u.%u.%u.%u gw=%u.%u.%u.%u\n",
           (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF,
@@ -2466,6 +2812,13 @@ extern "C" void net_handle_eth(const uint8_t* frame, uint16_t len) {
         uint16_t avail = (uint16_t)(len - 14);
         if (iplen > avail) iplen = avail;         /* kaynaga guvenme */
         handle_ipv4(ip, iplen, frame + 6);
+    } else if (type == 0x86DD) {                 /* IPv6 */
+        if (len < 54) return;
+        const uint8_t* ip6 = frame + 14;
+        uint16_t avail = (uint16_t)(len - 14);
+        uint16_t plen = rd16(ip6 + 4);           /* payload uzunlugu (baslik haric) */
+        if (plen > avail - 40) plen = (uint16_t)(avail - 40);
+        handle_ipv6(ip6, (uint16_t)(40 + plen), frame + 6);
     }
 }
 
@@ -2490,6 +2843,273 @@ extern "C" bool net_ping(uint32_t ip) {
 
     if (!ping_done) return false;
     if (ping_reply_src != ip) return (ping_reply_src != 0);
+    return true;
+}
+
+/* ---- IPv6 helper'lar + ping6 (dış arayuz) ---- */
+
+/* IPv6 adresini gruplar halinde yazar; en uzun sifir dizisini "::" yapar. */
+extern "C" void net_ip6_fmt(const uint8_t* a, char* out, int cap) {
+    int best_begin = -1, best_len = 0, cur_begin = -1, cur_len = 0;
+    for (int i = 0; i < 8; i++) {
+        bool zero = (a[i * 2] == 0 && a[i * 2 + 1] == 0);
+        if (zero) {
+            if (cur_begin < 0) { cur_begin = i; cur_len = 1; }
+            else cur_len++;
+            if (cur_len > best_len) { best_begin = cur_begin; best_len = cur_len; }
+        } else cur_begin = -1;
+    }
+    if (best_len < 2) best_begin = -1;
+    int o = 0;
+    bool after_dc = false;
+    for (int i = 0; i < 8; i++) {
+        if (best_begin == i) {
+            if (o + 2 >= cap) break;
+            out[o++] = ':'; out[o++] = ':';
+            while (i + 1 < 8 &&
+                   a[(i + 1) * 2] == 0 && a[(i + 1) * 2 + 1] == 0) i++;
+            after_dc = true;
+            continue;
+        }
+        if (i > 0 && !after_dc) { if (o < cap - 1) out[o++] = ':'; }
+        after_dc = false;
+        uint32_t g = ((uint32_t)a[i * 2] << 8) | a[i * 2 + 1];
+        char tmp[5]; int n = 0;
+        do { tmp[n++] = "0123456789abcdef"[g & 0xF]; g >>= 4; } while (g && n < 4);
+        while (n && o < cap - 1) out[o++] = tmp[--n];
+    }
+    if (o >= cap) o = cap - 1;
+    out[o] = 0;
+}
+
+/* IPv6 adresini cozer: "::" kisaltmasi destekli, sayilar hex. */
+extern "C" bool net_ip6_parse(const char* s, uint8_t out[16]) {
+    uint16_t g[8];
+    int ng = 0;
+    bool dc = false;
+    int before_dc = -1;
+    const char* p = s;
+    if (s[0] == ':' && s[1] == ':') { dc = true; p += 2; }
+    while (*p) {
+        uint32_t v = 0; int d = 0;
+        while (*p && *p != ':') {
+            char c = *p;
+            uint32_t h;
+            if (c >= '0' && c <= '9') h = (uint32_t)(c - '0');
+            else if (c >= 'a' && c <= 'f') h = (uint32_t)(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') h = (uint32_t)(c - 'A' + 10);
+            else return false;
+            if (++d > 4) return false;
+            v = v * 16u + h;
+            p++;
+        }
+        if (d == 0) return false;                    /* bos grup gecersiz */
+        if (ng >= 8) return false;
+        g[ng++] = (uint16_t)v;
+        if (*p == ':' && p[1] == ':') {
+            if (dc) return false;                    /* yalnizca bir "::" olabilir */
+            dc = true; before_dc = ng;
+            p += 2;
+        } else if (*p == ':') {
+            p++;
+            if (!*p) return false;                   /* sondaki ":" gecersiz */
+        }
+    }
+    memset(out, 0, 16);
+    if (dc) {
+        if (before_dc < 0) before_dc = 0;            /* bastaki "::" */
+        int after = ng - before_dc;
+        if (ng >= 8) return false;                   /* "::" en az bir grup dolduur */
+        for (int i = 0; i < before_dc; i++) {
+            out[i * 2] = (uint8_t)(g[i] >> 8);
+            out[i * 2 + 1] = (uint8_t)(g[i] & 0xFF);
+        }
+        for (int i = 0; i < after; i++) {
+            out[(8 - after + i) * 2] = (uint8_t)(g[before_dc + i] >> 8);
+            out[(8 - after + i) * 2 + 1] = (uint8_t)(g[before_dc + i] & 0xFF);
+        }
+    } else {
+        if (ng != 8) return false;
+        for (int i = 0; i < 8; i++) {
+            out[i * 2] = (uint8_t)(g[i] >> 8);
+            out[i * 2 + 1] = (uint8_t)(g[i] & 0xFF);
+        }
+    }
+    return true;
+}
+
+extern "C" bool net_ping6(const uint8_t* ip6, uint32_t hop) {
+    if (!ip6_ll_ok) return false;
+    uint8_t src[16];
+    if (ip6_is_ll(ip6)) memcpy(src, ip6_ll, 16);
+    else if (ip6_global_ok) memcpy(src, ip6_global, 16);
+    else memcpy(src, ip6_ll, 16);
+
+    uint8_t pkt[16];
+    memset(pkt, 0, 16);
+    pkt[0] = 128;                                   /* echo istek */
+    wr16(pkt + 4, ++ping6_ident);
+    wr16(pkt + 6, (uint16_t)hop);
+    memcpy(pkt + 8, "COFEUOS6", 8);
+
+    memcpy(ping6_want, ip6, 16);
+    ping6_active = true; ping6_done = false;
+    ipv6_send(src, ip6, 58, pkt, 16, NULL);
+
+    uint64_t deadline = timer_get_ticks() + 100;      /* 1 sn */
+    while (!ping6_done && timer_get_ticks() < deadline && !sys_intr_pending()) { sys_intr_poll(); cpu_hlt(); }
+    ping6_active = false;
+
+    if (!ping6_done) return false;
+    return ip6_eq(ping6_reply_src, ip6);
+}
+
+extern "C" bool net_get_ip6_ll(uint8_t out[16]) {
+    if (!ip6_ll_ok) return false;
+    memcpy(out, ip6_ll, 16);
+    return true;
+}
+
+extern "C" bool net_get_ip6_global(uint8_t out[16]) {
+    if (!ip6_global_ok) return false;
+    memcpy(out, ip6_global, 16);
+    return true;
+}
+
+extern "C" bool net_get_gw6(uint8_t out[16]) {
+    if (!gateway6_ok) return false;
+    memcpy(out, gateway6, 16);
+    return true;
+}
+
+/* IPv6 sahte (sentetik) selftest: NDP NS->NA, komu ogrenme, echo req->reply,
+   RA->SLAAC global adresi. Ag gerektirmez (ethsnoop/eth_mute izolasyonlu). */
+extern "C" bool net_ip6_selftest(void) {
+    if (!net_active()) return false;
+    if (!ip6_ll_ok) ip6_compute_ll();
+
+    static const uint8_t fake_mac[6] = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    uint8_t fe80_1[16];
+    net_ip6_parse("fe80::1", fe80_1);
+
+    ethsnoop = true; ethsnoop_n = 0; eth_mute = true;   /* gozlem altinda */
+
+    /* 1) NS (bizim ll icin) -> NA yaniti cikmali (tip 136, tgt=ll, opt mac=our_mac) */
+    ethsnoop_n = 0;
+    uint8_t ns[40 + 32];
+    memset(ns, 0, sizeof(ns));
+    ns[0] = 0x60;
+    wr16(ns + 4, 32);
+    ns[6] = 58; ns[7] = 64;
+    memcpy(ns + 8, fe80_1, 16);
+    ip6_solicited(ip6_ll, ns + 24);
+    ns[40 + 0] = 135; ns[40 + 1] = 0;                    /* icmp6: NS */
+    memcpy(ns + 40 + 8, ip6_ll, 16);                     /* hedef adres */
+    ns[40 + 24] = 1; ns[40 + 25] = 1;                    /* kaynak link-layer secenegi */
+    memcpy(ns + 40 + 26, fake_mac, 6);
+    wr16(ns + 40 + 2, icmp6_checksum(fe80_1, ns + 24, ns + 40, 32));
+    handle_ipv6(ns, 40 + 32, fake_mac);
+    if (ethsnoop_n != 1) { eth_mute = false; ethsnoop = false; return false; }
+    {
+        const uint8_t* fr = ethsnoop_frame[0];
+        if (rd16(fr + 12) != 0x86DD) { eth_mute = false; ethsnoop = false; return false; }
+        const uint8_t* ip6 = fr + 14;
+        const uint8_t* c = ip6 + 40;
+        if (ip6[6] != 58 || c[0] != 136) { eth_mute = false; ethsnoop = false; return false; }
+        if (!ip6_eq(c + 8, ip6_ll)) { eth_mute = false; ethsnoop = false; return false; }
+        if (memcmp(c + 26, our_mac, 6) != 0) { eth_mute = false; ethsnoop = false; return false; }
+    }
+
+    /* 2) fe80::1 icin NA -> komu cache'inde ogrenilmeli */
+    ethsnoop_n = 0;
+    uint8_t na[40 + 24 + 8];
+    memset(na, 0, sizeof(na));
+    na[0] = 0x60;
+    wr16(na + 4, 24);
+    na[6] = 58; na[7] = 64;
+    memcpy(na + 8, fe80_1, 16);
+    memcpy(na + 24, ip6_ll, 16);                        /* NA unicast bize */
+    na[40 + 0] = 136; na[40 + 1] = 0; na[40 + 4] = 0x60;
+    memcpy(na + 40 + 8, fe80_1, 16);
+    na[40 + 24] = 2; na[40 + 25] = 1;                   /* hedef link-layer secenegi */
+    memcpy(na + 40 + 26, fake_mac, 6);
+    wr16(na + 40 + 2, icmp6_checksum(fe80_1, ip6_ll, na + 40, 24));
+    handle_ipv6(na, 40 + 24, fake_mac);
+    {
+        uint8_t mm[6];
+        if (!nd6_lookup(fe80_1, mm) || memcmp(mm, fake_mac, 6) != 0) {
+            eth_mute = false; ethsnoop = false; return false;
+        }
+    }
+
+    /* 3) echo istek (fe80::1 -> bizim ll) -> yanit (tip 129, ayni ident) */
+    ethsnoop_n = 0;
+    uint8_t er[40 + 16];
+    memset(er, 0, sizeof(er));
+    er[0] = 0x60;
+    wr16(er + 4, 16);
+    er[6] = 58; er[7] = 64;
+    memcpy(er + 8, fe80_1, 16);
+    memcpy(er + 24, ip6_ll, 16);
+    er[40 + 0] = 128; er[40 + 1] = 0;                    /* echo request */
+    wr16(er + 40 + 4, 0x5151);
+    wr16(er + 40 + 6, 3);
+    memcpy(er + 40 + 8, "COFEUOS6", 8);
+    wr16(er + 40 + 2, icmp6_checksum(fe80_1, ip6_ll, er + 40, 16));
+    handle_ipv6(er, 40 + 16, fake_mac);
+    if (ethsnoop_n != 1) { eth_mute = false; ethsnoop = false; return false; }
+    {
+        const uint8_t* fr = ethsnoop_frame[0];
+        const uint8_t* ip6 = fr + 14;
+        const uint8_t* c = ip6 + 40;
+        if (ip6[6] != 58 || c[0] != 129) { eth_mute = false; ethsnoop = false; return false; }
+        if (rd16(c + 4) != 0x5151) { eth_mute = false; ethsnoop = false; return false; }
+        if (icmp6_checksum(ip6 + 8, ip6 + 24, c, rd16(ip6 + 4)) != 0) {
+            eth_mute = false; ethsnoop = false; return false;
+        }
+    }
+
+    /* 4) RA (fe80::2, 2001:db8::/64, L+A) -> global adres + geçit kurulmali */
+    bool old_global = ip6_global_ok;
+    uint8_t old_g[16]; if (old_global) memcpy(old_g, ip6_global, 16);
+    bool old_gw = gateway6_ok;
+    uint8_t old_gw6[16]; if (old_gw) memcpy(old_gw6, gateway6, 16);
+    ip6_global_ok = false;
+    ethsnoop_n = 0;
+    uint8_t ra[40 + 40];
+    memset(ra, 0, sizeof(ra));
+    ra[0] = 0x60;
+    wr16(ra + 4, 40);
+    ra[6] = 58; ra[7] = 64;
+    uint8_t fe80_2[16];
+    net_ip6_parse("fe80::2", fe80_2);
+    static const uint8_t alln[16] = { 0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    memcpy(ra + 8, fe80_2, 16);
+    memcpy(ra + 24, alln, 16);
+    ra[40 + 0] = 134; ra[40 + 1] = 0;                    /* RA */
+    ra[40 + 4] = 64; ra[40 + 5] = 0;                     /* cur hop limit, M=0 O=0 */
+    ra[40 + 8] = 3; ra[40 + 9] = 4;                      /* prefix bilgisi: 4*8=32 bayt */
+    ra[40 + 10] = 64; ra[40 + 11] = 0xC0;                /* len=64, L|A */
+    /* valid/preferred/reserved -> memset ile sifir */
+    static const uint8_t pre[8] = { 0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0 };
+    memcpy(ra + 40 + 24, pre, 8);                        /* on ek */
+    memcpy(ra + 40 + 32, ip6_ll + 8, 8);                 /* arayuz kimligi (onemsiz) */
+    wr16(ra + 40 + 2, icmp6_checksum(fe80_2, alln, ra + 40, 40));
+    handle_ipv6(ra, 40 + 40, fake_mac);
+    {
+        uint8_t expect[16];
+        ip6_from_eui64(expect, pre);
+        bool ok = ip6_global_ok && ip6_eq(ip6_global, expect);
+        if (old_global) { ip6_global_ok = true; memcpy(ip6_global, old_g, 16); }
+        else ip6_global_ok = false;
+        if (old_gw) memcpy(gateway6, old_gw6, 16); else gateway6_ok = false;
+        if (!ok) { eth_mute = false; ethsnoop = false; return false; }
+    }
+
+    /* temizlik: sahte komu cache'ini kaldir, izolasyonu kapata */
+    for (int i = 0; i < 8; i++)
+        if (nd6_cache[i].valid && ip6_eq(nd6_cache[i].ip, fe80_1)) nd6_cache[i].valid = false;
+    eth_mute = false; ethsnoop = false;
     return true;
 }
 
@@ -2698,6 +3318,21 @@ extern "C" void net_ifconfig(void) {
                 ? (dhcp_lease_until - timer_get_ticks()) / 100u : 0u));
     kprintf("eth0  MAC  : %02x:%02x:%02x:%02x:%02x:%02x\n",
             our_mac[0], our_mac[1], our_mac[2], our_mac[3], our_mac[4], our_mac[5]);
+    if (ip6_ll_ok) {
+        char b[48];
+        net_ip6_fmt(ip6_ll, b, sizeof(b));
+        kprintf("eth0  IPv6 : %s%%eth0 (link-local)\n", b);
+    }
+    if (ip6_global_ok) {
+        char b[48];
+        net_ip6_fmt(ip6_global, b, sizeof(b));
+        kprintf("eth0  IPv6 : %s/64 (SLAAC)\n", b);
+    }
+    if (gateway6_ok) {
+        char b[48];
+        net_ip6_fmt(gateway6, b, sizeof(b));
+        kprintf("eth0  YolV6: %s\n", b);
+    }
     kprintf("istatistik  : rx=%llu tx=%llu rx-bayt=%llu\n",
             (unsigned long long)stat_rx, (unsigned long long)stat_tx,
             (unsigned long long)stat_rx_bytes);

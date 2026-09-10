@@ -24,6 +24,15 @@ void     net_sockdump(void);                                /* TCP soket durumla
 bool     net_active(void);
 uint32_t net_parse_ip(const char* s, bool* ok);
 
+/* --- IPv6 (RFC 8200) + ICMPv6/NDP (RFC 4443/4861) --- */
+void     net_ip6_fmt(const uint8_t* a, char* out, int cap); /* "::" kisaltmali metin */
+bool     net_ip6_parse(const char* s, uint8_t out[16]);     /* adres coz */
+bool     net_ping6(const uint8_t* ip6, uint32_t hop);       /* ping6 gonder, sonuc don */
+bool     net_get_ip6_ll(uint8_t out[16]);                   /* link-local adres */
+bool     net_get_ip6_global(uint8_t out[16]);               /* SLAAC global (yoksa false) */
+bool     net_get_gw6(uint8_t out[16]);                      /* RA'dan geçit */
+bool     net_ip6_selftest(void);                            /* NDP/ICMPv6/SLAAC sentetik test */
+
 /* --- tam TCP (RFC 793/1122/6298) --- coklu soket: fd = net_socket() --- */
 int      net_socket(void);                                       /* yeni bos soket (fd) veya -1 */
 bool     net_tcp_connect(int s, uint32_t ip, uint16_t port);     /* aktif acilis (engelleyici) */
