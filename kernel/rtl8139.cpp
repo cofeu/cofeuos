@@ -531,7 +531,18 @@ namespace {
 static void nic_send(const uint8_t* frame, uint16_t len) { rtl8139_send(frame, len); }
 static void nic_poll(void) { rtl8139_poll(); }
 static void nic_irq(void)  { rtl8139_irq(); }
-static const NicOps rtl8139_ops = { nic_send, nic_poll, nic_irq, rtl8139_active };
+static bool nic_active(void) { return rtl8139_active(); }
+static bool nic_link(void)   { return rtl8139_link(); }
+static void nic_stats(NicStats* out) {
+    out->rx_ok   = st_rx_ok;
+    out->rx_err  = st_rx_err;
+    out->rx_drop = st_rx_drop;
+    out->rx_ovw  = st_rx_ovw;
+    out->tx_ok   = st_tx_ok;
+    out->tx_err  = st_tx_err;
+    out->tx_drop = st_tx_drop;
+}
+static const NicOps rtl8139_ops = { nic_send, nic_poll, nic_irq, nic_active, nic_link, nic_stats };
 }
 
 extern "C" bool rtl8139_nic_probe(const PCIDevice* pci, NicDevice* out) {

@@ -3336,6 +3336,20 @@ extern "C" void net_ifconfig(void) {
     kprintf("istatistik  : rx=%llu tx=%llu rx-bayt=%llu\n",
             (unsigned long long)stat_rx, (unsigned long long)stat_tx,
             (unsigned long long)stat_rx_bytes);
+
+    const NicDevice* nc = nic_current();
+    if (nc) {
+        kprintf("NIC   : %s (%s) link=%s\n",
+                nc->name, nc->kind == NIC_WIRED ? "kablolu" : "kablosuz",
+                nic_link() ? "ACIK" : "kapali");
+        NicStats ns;
+        nic_stats(&ns);
+        kprintf("NIC ist : rx-ok=%llu rx-err=%llu rx-drop=%llu rx-ovw=%llu | tx-ok=%llu tx-err=%llu tx-drop=%llu\n",
+                (unsigned long long)ns.rx_ok, (unsigned long long)ns.rx_err,
+                (unsigned long long)ns.rx_drop, (unsigned long long)ns.rx_ovw,
+                (unsigned long long)ns.tx_ok, (unsigned long long)ns.tx_err,
+                (unsigned long long)ns.tx_drop);
+    }
 }
 
 extern "C" uint32_t net_get_dns(void) { return dns_server; }

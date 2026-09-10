@@ -9,11 +9,18 @@
 
 enum { NIC_WIRED = 1, NIC_WIFI = 2 };
 
+struct NicStats {
+    uint64_t rx_ok, rx_err, rx_drop, rx_ovw;
+    uint64_t tx_ok, tx_err, tx_drop;
+};
+
 struct NicOps {
     void (*send)(const uint8_t* frame, uint16_t len);
     void (*poll)(void);                 /* zamanlayici cagrisi (RX kuyrugu) */
     void (*irq)(void);                  /* PCI kesme handleri */
     bool (*active)(void);
+    bool (*link)(void);                 /* ortam baglanti durumu: kablolu=MII link beat, wifi=eglesme */
+    void (*stats)(NicStats* out);       /* surucu seviyesi sayaclari */
 };
 
 struct NicDevice {
@@ -40,6 +47,8 @@ const NicDevice* nic_get(int idx);
 const NicDevice* nic_current(void);
 void nic_send(const uint8_t* frame, uint16_t len);   /* aktif karta gonder */
 bool nic_up(void);                                   /* aktif kart calisiyor mu */
+bool nic_link(void);                                 /* aktif kartta ortam baglantisi var mi */
+void nic_stats(NicStats* out);                       /* aktif kart sayaclari */
 void nic_poll_all(void);
 void nic_irq(int irq);
 

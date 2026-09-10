@@ -81,6 +81,19 @@ extern "C" bool nic_up(void) {
     return d && d->up && d->ops && d->ops->active && d->ops->active();
 }
 
+extern "C" bool nic_link(void) {
+    const NicDevice* d = nic_current();
+    if (!d || !d->up || !d->ops || !d->ops->link) return false;
+    return d->ops->link();
+}
+
+extern "C" void nic_stats(NicStats* out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    const NicDevice* d = nic_current();
+    if (d && d->up && d->ops && d->ops->stats) d->ops->stats(out);
+}
+
 extern "C" void nic_poll_all(void) {
     for (int i = 0; i < ndev; i++)
         if (devs[i].up && devs[i].ops && devs[i].ops->poll) devs[i].ops->poll();

@@ -144,7 +144,11 @@ static void e1000_irq(void) { e1000_poll(); }
 
 static bool e1000_active(void) { return up; }
 
-static const NicOps e1000_ops = { e1000_send, e1000_poll, e1000_irq, e1000_active };
+static bool e1000_link(void) { return up && (reg_read(R_STATUS) & 0x04) != 0; }   /* LU */
+
+static void e1000_stats(NicStats* out) { (void)out; }
+
+static const NicOps e1000_ops = { e1000_send, e1000_poll, e1000_irq, e1000_active, e1000_link, e1000_stats };
 
 extern "C" bool e1000_nic_probe(const PCIDevice* pci, NicDevice* out) {
     if (up) return false;
