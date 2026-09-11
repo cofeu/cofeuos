@@ -7,7 +7,12 @@
 #include "net.h"
 
 /* Intel 82540EM e1000 (QEMU). Kayitlar MMIO (BAR0), legacy 16-bayt
-   descriptor bicimi kullanilir. RX/TX tek veya az sayida descriptor. */
+   descriptor bicimi kullanilir.
+   - RX: 16 tampon + 16'lik ring; RAR0(AV) unicast, BAM broadcast,
+     MPE multicast kabulu (QEMU filtresi RAL/RAH + MTA kullanir).
+     CRC (dalga SECRC'siz dahildir) yazilimda -4 ile ayrilir.
+   - TX: 8 slot'luk ring, her cerceve tek descriptor (EOP|IFCS|RS),
+     senkron (DD beklenir). */
 
 namespace {
 
@@ -30,25 +35,37 @@ constexpr uint32_t R_TDBAH   = 0x3804;
 constexpr uint32_t R_TDLEN   = 0x3808;
 constexpr uint32_t R_TDH     = 0x3810;
 constexpr uint32_t R_TDT     = 0x3818;
+constexpr uint32_t R_MTA     = 0x5200;
 constexpr uint32_t R_RAL     = 0x5400;
 constexpr uint32_t R_RAH     = 0x5404;
 
 constexpr uint32_t CTRL_RST  = 0x04000000;
 constexpr uint32_t CTRL_SLU  = 0x00000040;
+constexpr uint32_t STATUS_LU = 0x00000002;      /* Link Up */
+
 constexpr uint32_t RCTL_EN   = 0x00000002;
-constexpr uint32_t RCTL_BAM  = 0x00008000;
+constexpr uint32_t RCTL_MPE  = 0x00000010;      /* multicast promiscuous */
+constexpr uint32_t RCTL_LPE  = 0x00000020;      /* long packet enable */
+constexpr uint32_t RCTL_BAM  = 0x00008000;      /* broadcast enable */
+
 constexpr uint32_t TCTL_EN   = 0x00000002;
 constexpr uint32_t TCTL_PSP  = 0x00000008;
-constexpr uint32_t TCTL_CT   = 0x00000010;
-constexpr uint32_t TCTL_COLD = 0x00040000;
+/* CT(alisen) = 15<<4, COLD = 63<<12 (Linux e1000 degerleri) */
+constexpr uint32_t TCTL_CT   = 0x000000F0;
+constexpr uint32_t TCTL_COLD = 0x0003F000;
 
-constexpr uint32_t DD_STAT   = 0x0001;
-constexpr uint8_t  TCMD_EOP  = 0x01;
-constexpr uint8_t  TCMD_IFCS = 0x02;
-constexpr uint8_t  TCMD_RS   = 0x08;
+constexpr uint8_t  RXS_DD    = 0x01;   /* descriptor done */
+constexpr uint8_t  RXS_EOP   = 0x02;   /* end of packet */
+constexpr uint8_t  RXE_CE    = 0x01;   /* CRC error */
+constexpr uint8_t  RXE_SEQ   = 0x04;   /* sequence error */
+constexpr uint8_t  RXE_RXE   = 0x80;   /* rx data error */
 
-enum { RX_SLOTS = 16, RX_BUF   = 2048 };
-enum { TX_SLOTS = 1 };
+constexpr uint8_t  TXC_EOP   = 0x01;
+constexpr uint8_t  TXC_IFCS  = 0x02;   /* insert FCS (eski term: append CRC) */
+constexpr uint8_t  TXC_RS    = 0x08;   /* report status (DD yazimi) */
+
+enum { RX_SLOTS = 16, RX_BUF = 2048 };
+enum { TX_SLOTS = 8 };
 
 struct RxDesc {
     uint64_t addr;
@@ -74,13 +91,23 @@ uint8_t   mac[6];
 bool      up = false;
 
 /* RX: 16 tampon (2048 bayt) + 16'lik descriptor halkasi */
-uint8_t*  rx_bufs[RX_SLOTS];
-RxDesc*   rx_ring = NULL;
-uint32_t  rx_next = 0;            /* konsum edilecek sonraki slot */
+uint8_t*        rx_bufs[RX_SLOTS];
+volatile RxDesc* rx_ring = NULL;
+uint32_t         rx_next = 0;
 
-/* TX: tek descriptor + tek tampon (senkron gonderim) */
-uint8_t*  tx_buf = NULL;
-TxDesc*   tx_ring = NULL;
+/* TX: 8 slot, her birine kendi tamponu (senkron gonderim). */
+volatile TxDesc* tx_ring = NULL;
+uint8_t*         tx_bufs[TX_SLOTS];
+uint32_t         tx_next = 0;
+
+/* NIC sayaclari (ifconfig NIC ist satiri) */
+uint64_t st_rx_ok   = 0;
+uint64_t st_rx_err  = 0;
+uint64_t st_rx_drop = 0;
+uint64_t st_rx_ovw  = 0;
+uint64_t st_tx_ok   = 0;
+uint64_t st_tx_err  = 0;
+uint64_t st_tx_drop = 0;
 
 uint32_t reg_read(uint32_t off)   { return mmio[off / 4]; }
 void     reg_write(uint32_t off, uint32_t v) { mmio[off / 4] = v; }
@@ -94,44 +121,61 @@ uint16_t eeprom_read(int reg) {
     return 0;
 }
 
-bool rx_read_ok(void) {
-    return (rx_ring[rx_next].status & DD_STAT) != 0;
-}
+/* RX: DD'li slotlari tuket. Tur atlama: EOP olmayan (coklu-descriptor)
+   cerceveler, hatali (CE/SEQ/RXE) cerceveler dusurulur. */
+static void rx_process(void) {
+    bool skipping = false;
+    while (rx_ring[rx_next].status & RXS_DD) {
+        volatile RxDesc& d = rx_ring[rx_next];
+        bool eop = (d.status & RXS_EOP) != 0;
 
-void rx_process(void) {
-    while (rx_read_ok()) {
-        RxDesc& d = rx_ring[rx_next];
-        uint16_t len = d.length;
-        if (len > 4) len = (uint16_t)(len - 4);      /* son 4 = CRC */
-        if (len > 1514) len = 1514;
-        net_handle_eth(rx_bufs[rx_next], len);
+        if (skipping) {
+            if (eop) skipping = false;
+            st_rx_drop++;
+        } else if (!eop) {
+            skipping = true;
+            st_rx_drop++;
+        } else if (d.errors & (RXE_CE | RXE_SEQ | RXE_RXE)) {
+            st_rx_err++;
+        } else {
+            uint16_t len = d.length;
+            if (len > 4) len = (uint16_t)(len - 4);       /* son 4 = CRC */
+            if (len > 1514) len = 1514;
+            net_handle_eth(rx_bufs[rx_next], len);
+            st_rx_ok++;
+        }
         d.status = 0;
-        reg_write(R_RDT, rx_next);                    /* tamponu yeniden ver */
+        d.errors = 0;
+        reg_write(R_RDT, rx_next);         /* tamponu yeniden ver */
         rx_next = (rx_next + 1) % RX_SLOTS;
     }
 }
 
-void tx_wait(void) {
-    for (int i = 0; i < 500000; i++) {
-        if (tx_ring[0].status & DD_STAT) break;
-    }
-    tx_ring[0].status = 0;
-    reg_write(R_TDH, 0);
-    reg_write(R_TDT, 0);
-}
-
-} /* namespace */
-
+/* Busy-wait ile senkron TX: slot kullanilabilir olana kadar bekle,
+   gonder, DD gorunene kadar bekle. */
 static void e1000_send(const uint8_t* frame, uint16_t len) {
-    if (!up) return;
+    if (!up) { st_tx_drop++; return; }
     if (len > 1514) len = 1514;
-    memcpy(tx_buf, frame, len);
-    tx_ring[0].addr   = (uint64_t)(uintptr_t)tx_buf;
-    tx_ring[0].length = len;
-    tx_ring[0].cmd    = TCMD_EOP | TCMD_IFCS | TCMD_RS;
-    tx_ring[0].status = 0;
-    reg_write(R_TDT, 1);
-    tx_wait();
+
+    const uint32_t i = tx_next;
+    for (int w = 0; w < 500000 && !(tx_ring[i].status & RXS_DD); w++) { }
+    tx_ring[i].status = 0;
+
+    volatile TxDesc& t = tx_ring[i];
+    memcpy(tx_bufs[i], frame, len);
+    t.addr   = (uint64_t)(uintptr_t)tx_bufs[i];
+    t.length = len;
+    t.cso    = 0;
+    t.cmd    = TXC_EOP | TXC_IFCS | TXC_RS;
+    t.css    = 0;
+    t.special = 0;
+    reg_write(R_TDT, (i + 1) % TX_SLOTS);
+
+    for (int w = 0; w < 500000 && !(tx_ring[i].status & RXS_DD); w++) { }
+    if (tx_ring[i].status & RXS_DD) st_tx_ok++;
+    else                            st_tx_err++;
+    tx_ring[i].status = 0;
+    tx_next = (i + 1) % TX_SLOTS;
 }
 
 static void e1000_poll(void) {
@@ -144,11 +188,27 @@ static void e1000_irq(void) { e1000_poll(); }
 
 static bool e1000_active(void) { return up; }
 
-static bool e1000_link(void) { return up && (reg_read(R_STATUS) & 0x04) != 0; }   /* LU */
+static bool e1000_link(void) { return up && (reg_read(R_STATUS) & STATUS_LU) != 0; }
 
-static void e1000_stats(NicStats* out) { (void)out; }
+static void e1000_stats(NicStats* out) {
+    out->rx_ok   = st_rx_ok;
+    out->rx_err  = st_rx_err;
+    out->rx_drop = st_rx_drop;
+    out->rx_ovw  = st_rx_ovw;
+    out->tx_ok   = st_tx_ok;
+    out->tx_err  = st_tx_err;
+    out->tx_drop = st_tx_drop;
+}
 
 static const NicOps e1000_ops = { e1000_send, e1000_poll, e1000_irq, e1000_active, e1000_link, e1000_stats };
+
+/* multicast adresini MTA'ya isle (rasilan 12-bit dolu; MO=0 -> [47:36]).
+   Gercek 82540 ile QEMU ayni kurali kullanir (e1000x_rx_group_filter). */
+static void mta_add(const uint8_t* a) {
+    uint32_t h = (((uint32_t)a[5] << 4) | ((uint32_t)a[4] >> 4)) & 0xFFFu;
+    uint32_t off = R_MTA + 4 * (h >> 5);
+    reg_write(off, reg_read(off) | (1u << (h & 0x1Fu)));
+}
 
 extern "C" bool e1000_nic_probe(const PCIDevice* pci, NicDevice* out) {
     if (up) return false;
@@ -184,10 +244,20 @@ extern "C" bool e1000_nic_probe(const PCIDevice* pci, NicDevice* out) {
         mac[4] = (uint8_t)(rah & 0xFF); mac[5] = (uint8_t)((rah >> 8) & 0xFF);
     }
 
+    /* RX filtre: RAR0'da kendi MAC'imiz (AV). QEMU yalnizca eslesen
+       unicast'i kabul eder; bu olmadan yonlendirilmis paketler dusuyordu. */
+    reg_write(R_RAL, (uint32_t)mac[0] | ((uint32_t)mac[1] << 8) |
+                     ((uint32_t)mac[2] << 16) | ((uint32_t)mac[3] << 24));
+    reg_write(R_RAH, (uint32_t)mac[4] | ((uint32_t)mac[5] << 8) | 0x80000000u);
+
+    /* IPv6 all-nodes (33:33:00:00:00:01) MTA'ya; MPE diger multicastlari. */
+    static const uint8_t mcast_allip6[6] = { 0x33, 0x33, 0x00, 0x00, 0x00, 0x01 };
+    mta_add(mcast_allip6);
+
     /* RX ring + tamponlar */
-    rx_ring = (RxDesc*)pmm_alloc_frame();
+    rx_ring = (volatile RxDesc*)pmm_alloc_frame();
     if (!rx_ring) return false;
-    memset(rx_ring, 0, 4096);
+    memset((void*)rx_ring, 0, 4096);
     for (int i = 0; i < RX_SLOTS; i++) {
         rx_bufs[i] = (uint8_t*)pmm_alloc_frame();
         if (!rx_bufs[i]) return false;
@@ -201,12 +271,15 @@ extern "C" bool e1000_nic_probe(const PCIDevice* pci, NicDevice* out) {
     reg_write(R_RDT, RX_SLOTS - 1);
     rx_next = 0;
 
-    /* TX ring + tampon */
-    tx_ring = (TxDesc*)pmm_alloc_frame();
+    /* TX ring + tamponlar */
+    tx_ring = (volatile TxDesc*)pmm_alloc_frame();
     if (!tx_ring) return false;
-    memset(tx_ring, 0, 4096);
-    tx_buf = (uint8_t*)pmm_alloc_frame();
-    if (!tx_buf) return false;
+    memset((void*)tx_ring, 0, 4096);
+    tx_next = 0;
+    for (int i = 0; i < TX_SLOTS; i++) {
+        tx_bufs[i] = (uint8_t*)pmm_alloc_frame();
+        if (!tx_bufs[i]) return false;
+    }
     reg_write(R_TDBAL, (uint32_t)(uintptr_t)tx_ring);
     reg_write(R_TDBAH, 0);
     reg_write(R_TDLEN, TX_SLOTS * 16);
@@ -214,7 +287,7 @@ extern "C" bool e1000_nic_probe(const PCIDevice* pci, NicDevice* out) {
     reg_write(R_TDT, 0);
 
     /* etkinlestir */
-    reg_write(R_RCTL, RCTL_EN | RCTL_BAM);                      /* CRC length'e dahil, -4 kendi elimizde */
+    reg_write(R_RCTL, RCTL_EN | RCTL_BAM | RCTL_MPE | RCTL_LPE);
     reg_write(R_TCTL, TCTL_EN | TCTL_PSP | TCTL_CT | TCTL_COLD);
     reg_read(R_ICR);
     reg_write(R_IMS, 0x1F6DC);                              /* RX/TX kesme isleri */
@@ -232,3 +305,5 @@ extern "C" bool e1000_nic_probe(const PCIDevice* pci, NicDevice* out) {
     kslog("e1000 up irq=%d base=0x%x\n", pci->irq, base);
     return true;
 }
+
+} /* namespace */
